@@ -104,6 +104,26 @@ def build_card(parent, title: str = "", subtitle: str = "") -> ctk.CTkFrame:
     return card
 
 
+def divider(parent) -> None:
+    """一行细分隔线，用来把长表单分成几段。"""
+    ctk.CTkFrame(parent, fg_color=T.BORDER, height=1).pack(fill="x", pady=(T.S2, T.S1))
+
+
+def switch(parent, text: str, variable, command):
+    """统一的开关样式（运行页各处的开关都用它）。"""
+    return ctk.CTkSwitch(
+        parent,
+        text=text,
+        variable=variable,
+        command=command,
+        font=font(T.SM),
+        text_color=T.TEXT_DIM,
+        progress_color=T.ACCENT,
+        button_color=T.TEXT,
+        button_hover_color=T.TEXT,
+    )
+
+
 def build_status_pill(parent) -> tuple[ctk.CTkFrame, ctk.CTkLabel, ctk.CTkLabel]:
     """返回 (pill 容器, 圆点, 文字)，状态更新时只改颜色和文案。"""
     pill = ctk.CTkFrame(parent, fg_color=T.SURFACE, corner_radius=999, height=32)

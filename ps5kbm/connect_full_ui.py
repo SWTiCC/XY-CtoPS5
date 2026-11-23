@@ -34,7 +34,7 @@ def render_full(app, paired, state, probe_error, bridge, connecting) -> None:
         app._notice_card.pack_forget()
         app._notice_visible = False
 
-    busy = bridge is not None or connecting
+    busy = bridge is not None or connecting or state == flow.STATE_CHECKING
     app._notice_recheck_button.configure(
         state="disabled" if busy or paired is None else "normal"
     )

@@ -29,6 +29,30 @@ _LOGGER = logging.getLogger(__name__)
 
 user32 = ctypes.windll.user32
 
+# 调参键 → 动作的固定匹配顺序：同一键绑了多个动作时，先匹配到的生效
+_ADJUST_ORDER = ("r2_up", "r2_down", "l2_up", "l2_down")
+
+
+def adjust_action_for(keys: dict[str, str], name: str) -> str:
+    """按键名 → 扳机调参动作（r2_up / r2_down / l2_up / l2_down），没绑定时返回空串。
+
+    支持键盘键（`-` `=` 等）、鼠标键（`mouse_x1`）和滚轮（`wheel_up` / `wheel_down`）。
+    `+` 视为 `=` 的别名：中文输入法/Shift 组合下按加号也能调 L2。
+    """
+    lowered = (name or "").strip().lower()
+    if not lowered:
+        return ""
+    for action in _ADJUST_ORDER:
+        key = str(keys.get(action) or "").strip().lower()
+        if key and key == lowered:
+            return action
+    if lowered == "+":
+        for action in _ADJUST_ORDER:
+            if str(keys.get(action) or "").strip().lower() == "=":
+                return action
+    return ""
+
+
 
 class InputSource:
     """pynput 全局监听 + 光标锁定轮询。"""
@@ -65,16 +89,16 @@ class InputSource:
         self._mode_switch = ""
         self._mode_switch_down = False
         self._on_mode_switch = None
-        self._on_scroll_callback = None
-        self._on_l2_adjust = None
+        self._adjust_keys: dict[str, str] = {}
+        self._on_adjust = None
 
-    def set_l2_adjust_callback(self, callback) -> None:
-        """注册 L2 深度调整回调（键盘 - / = 触发，参数 ±1）。"""
-        self._on_l2_adjust = callback
-
-    def set_scroll_callback(self, callback) -> None:
-        """注册鼠标滚轮回调（捕获时生效），参数是滚轮方向 dy。"""
-        self._on_scroll_callback = callback
+    def set_trigger_adjust(self, keys: dict[str, str], callback) -> None:
+        """注册扳机调参键：keys 是 {动作: 按键名}，动作取 r2_up/r2_down/l2_up/l2_down。"""
+        self._adjust_keys = {
+            action: str(keys.get(action) or "").strip().lower()
+            for action in _ADJUST_ORDER
+        }
+        self._on_adjust = callback
 
     def set_mode_switch(self, name: str, callback) -> None:
         """注册模式切换键：按下时回调，切换由上层执行。"""
@@ -139,6 +163,10 @@ class InputSource:
         self._raw_mouse_ok = False
         self._stop_listeners()
         self._release_cursor()
+        # 停掉监听后捕获态一并归零，避免上层以为还在捕获
+        with self._lock:
+            self._capturing = False
+            self._down_keys.clear()
 
     @property
     def capturing(self) -> bool:
@@ -183,6 +211,22 @@ class InputSource:
         if callback:
             callback(state)
         return state
+
+    def set_capturing(self, value: bool) -> None:
+        """直接设定捕获状态（不触发回调），供上层纠正状态用。
+
+        典型场景：没有会话时误按了 F8，界面层要把输入层退回「未捕获」，
+        又不想让回调再触发一轮界面刷新。
+        """
+        with self._lock:
+            if self._capturing == bool(value):
+                return
+            self._capturing = bool(value)
+            self._down_keys.clear()
+        if self._capturing:
+            self._lock_cursor()
+        else:
+            self._release_cursor()
 
     # ------------------------------------------------------------ 鼠标位移
     def _on_raw_mouse_delta(self, dx: int, dy: int) -> None:
@@ -319,12 +363,13 @@ class InputSource:
 
     def _handle_key(self, name: str, pressed: bool) -> None:
         """所有键盘来源（pynput / 钩子 / Raw Input）的统一入口，按名字去重。"""
-        # 键盘 - / = 调整 L2 输出深度（捕获时生效）
-        if self._on_l2_adjust is not None and name in ("-", "=", "+"):
-            if pressed:
-                self._on_l2_adjust(-1 if name == "-" else 1)
+        # 调参键只在捕获中生效：否则在别的窗口打字按到 = / - 会偷偷改扳机深度
+        adjust = adjust_action_for(self._adjust_keys, name)
+        if adjust and self._capturing:
+            if pressed and self._on_adjust is not None:
+                self._on_adjust(adjust)
             return
-        if name == self._mode_switch:
+        if name == self._mode_switch and self._capturing:
             if pressed:
                 if not self._mode_switch_down:
                     self._mode_switch_down = True
@@ -366,15 +411,22 @@ class InputSource:
         )
 
     def _on_scroll(self, x, y, dx, dy) -> None:
-        """鼠标滚轮：捕获中用于调整 L2 扳机深度。"""
-        if self._capturing and self._on_scroll_callback:
-            self._on_scroll_callback(dy)
+        """鼠标滚轮：捕获中用于调整绑定了 wheel_up / wheel_down 的扳机。"""
+        if not self._capturing:
+            return
+        adjust = adjust_action_for(
+            self._adjust_keys, "wheel_up" if dy > 0 else "wheel_down"
+        )
+        if adjust and self._on_adjust is not None:
+            self._on_adjust(adjust)
 
     def _handle_mouse(self, name: str, pressed: bool) -> None:
         # 鼠标键也允许当作模式切换键（name 是 left/right/middle/x1/x2）
         full_name = f"mouse_{name}"
-        if self._mode_switch and (
-            full_name == self._mode_switch or name == self._mode_switch
+        if (
+            self._mode_switch
+            and self._capturing
+            and (full_name == self._mode_switch or name == self._mode_switch)
         ):
             if pressed:
                 if not self._mode_switch_down:
@@ -383,6 +435,12 @@ class InputSource:
                         self._on_mode_switch()
             else:
                 self._mode_switch_down = False
+            return
+        # 鼠标键也可以绑成调参键（同样只在捕获中生效）
+        adjust = adjust_action_for(self._adjust_keys, full_name)
+        if adjust and self._capturing:
+            if pressed and self._on_adjust is not None:
+                self._on_adjust(adjust)
             return
         if self._capturing:
             self._mapper.on_mouse_button(name, pressed)

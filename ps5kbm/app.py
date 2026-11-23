@@ -11,20 +11,33 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import logging
 import os
 import queue
 import threading
 import time
 import tkinter as tk
+from collections import Counter
 from tkinter import messagebox
 
 import customtkinter as ctk
 
-from . import bridge, config, connect_ui, probe, ui_pages, windows
+from . import (
+    bridge,
+    config,
+    connect_ui,
+    mapping_ui,
+    probe,
+    run_tuning_ui,
+    run_ui,
+    ui_pages,
+    windows,
+)
 from . import connect_flow as flow
 from . import theme as T
 from .input_source import InputSource
+from .keys import display_key
 from .mapping import InputMapper
 from .overlay import CaptureOverlay
 from .ui_common import (
@@ -32,9 +45,12 @@ from .ui_common import (
     KeyCaptureDialog,
     QueueLogHandler,
     StickKeysEditor,
+    describe_action,
 )
 
 TICK_SECONDS = 1.0 / 250.0
+# 日志面板最多保留的行数：长时间挂着不会无限变长
+LOG_MAX_LINES = 800
 
 
 class Ps5KbmApp:
@@ -57,6 +73,13 @@ class Ps5KbmApp:
         self._connecting = False
         # 用户是否主动切到完整流程（点过「换 ID 连接」）；是的话检测结果不再把人拽回去
         self._manual_full = False
+        # 上一个会话是否还在后台关闭：重连前要等它收尾，避免 PS5 上残留两条会话
+        self._closing = False
+        # 模式下拉框：显示文本 → 模式 id（重名时显示文本会带上 id）
+        self._mode_option_map: dict[str, str] = {}
+        # 当前内存里的 modes 是从哪个预设加载的：只有和 _config.preset 一致时才允许自动写回预设文件，
+        # 避免「删掉当前预设后回落到别的预设」时把旧内容覆盖到另一个预设上。
+        self._preset_owner = ""
         self._state_vars()
 
         self._loop = asyncio.new_event_loop()
@@ -101,6 +124,8 @@ class Ps5KbmApp:
         self._pin_var = tk.StringVar()
         self._preset_var = tk.StringVar(value=cfg.preset)
         self._preset_values = config.list_presets()
+        # 启动时内存里的 modes 就来自 config.preset 记录的那套
+        self._preset_owner = cfg.preset
 
     def _read_paired(self) -> flow.PairedConsole | None:
         """从 credentials.json 提炼「已配对主机」；文件缺失或损坏都当作没配对。"""
@@ -162,8 +187,9 @@ class Ps5KbmApp:
         self._source.set_capture_callback(self._on_capture_changed)
         self._source.set_key_callback(self._on_key_event)
         self._source.set_mode_switch(self._config.mode_switch, self._on_mode_switch)
-        self._source.set_scroll_callback(self._on_wheel)
-        self._source.set_l2_adjust_callback(self._on_l2_adjust)
+        self._source.set_trigger_adjust(
+            config.trigger_adjust_keys(self._config), self._on_adjust
+        )
         self._source_ready = False
         return self._config
 
@@ -172,14 +198,51 @@ class Ps5KbmApp:
         return (mode.label if mode and mode.label else name) if mode else name
 
     # ------------------------------------------------------------ 模式管理
+    def _mode_option_labels(self) -> tuple[list[str], dict[str, str]]:
+        """模式下拉框的显示文本与「文本 → 模式 id」映射。
+
+        正常情况显示的就是 label；老配置里可能已经出现两个同名模式，
+        这时补上内部 id 消歧，否则第二个模式永远选不中。
+        """
+        counts = Counter(self._mode_label(name) for name in self._config.modes)
+        labels: list[str] = []
+        mapping: dict[str, str] = {}
+        for name in self._config.modes:
+            label = self._mode_label(name)
+            text = label if counts[label] == 1 else f"{label}（{name}）"
+            labels.append(text)
+            mapping[text] = name
+        return labels, mapping
+
+    def _mode_option_for(self, name: str) -> str:
+        """模式 id → 下拉框里对应的显示文本。"""
+        for text, mode_id in self._mode_option_labels()[1].items():
+            if mode_id == name:
+                return text
+        return self._mode_label(name)
+
+    def _mode_label_taken(self, label: str, exclude: str = "") -> bool:
+        """同一个预设里是否已经有别的模式用了这个显示名。"""
+        return any(
+            self._mode_label(name) == label
+            for name in self._config.modes
+            if name != exclude
+        )
+
     def choose_mode(self, label: str) -> None:
         """下拉框选择要编辑的模式。"""
-        for name in self._config.modes:
-            if self._mode_label(name) == label:
-                self._edit_mode = name
-                break
-        ui_pages.refresh_mapping_list(self)
-        ui_pages.refresh_stick_keys(self)
+        name = self._mode_option_map.get(label)
+        if name is None:
+            # 兜底：按显示名直接找（兼容没有维护映射表的调用路径）
+            for candidate in self._config.modes:
+                if self._mode_label(candidate) == label:
+                    name = candidate
+                    break
+        if name is None:
+            return
+        self._edit_mode = name
+        mapping_ui.refresh_mapping_list(self)
+        mapping_ui.refresh_stick_keys(self)
 
     def add_mode(self) -> None:
         dialog = ctk.CTkInputDialog(
@@ -187,6 +250,11 @@ class Ps5KbmApp:
         )
         label = (dialog.get_input() or "").strip()
         if not label:
+            return
+        if self._mode_label_taken(label):
+            messagebox.showwarning(
+                "模式重名", f"已经有一个模式叫「{label}」了，换个名字吧。"
+            )
             return
         name = f"mode{len(self._config.modes) + 1}"
         while name in self._config.modes:
@@ -209,6 +277,11 @@ class Ps5KbmApp:
         dialog = ctk.CTkInputDialog(text="新的模式名称", title="重命名模式")
         label = (dialog.get_input() or "").strip()
         if not label:
+            return
+        if self._mode_label_taken(label, exclude=self._edit_mode):
+            messagebox.showwarning(
+                "模式重名", f"已经有一个模式叫「{label}」了，换个名字吧。"
+            )
             return
         mode.label = label
         self._refresh_mode_ui()
@@ -236,21 +309,30 @@ class Ps5KbmApp:
         def on_captured(name: str | None) -> None:
             if not name:
                 return
+            reason = self._global_key_conflict(
+                name, ignore_mode_switch=self._config.mode_switch
+            )
+            if reason:
+                messagebox.showwarning(
+                    "这个键不能用",
+                    f"{display_key(name)} 是{reason}，换一个键吧。",
+                )
+                return
             self._config.mode_switch = name
             self._source.set_mode_switch(name, self._on_mode_switch)
             self._refresh_mode_ui()
             self._persist()
-            self._append_log(f"模式切换键已设为：{name.upper()}")
+            self._append_log(f"模式切换键已设为：{display_key(name)}")
 
         KeyCaptureDialog(self.root, on_captured)
 
     def _refresh_mode_ui(self) -> None:
-        ui_pages.refresh_mode_ui(self)
-        ui_pages.refresh_mapping_list(self)
-        ui_pages.refresh_stick_keys(self)
+        mapping_ui.refresh_mode_ui(self)
+        mapping_ui.refresh_mapping_list(self)
+        mapping_ui.refresh_stick_keys(self)
 
     def _on_mode_switch(self) -> None:
-        """模式切换键：循环切到下一个模式（只在捕获时生效）。"""
+        """模式切换键：循环切到下一个模式（只在捕获时生效，由输入层保证）。"""
         names = list(self._config.modes)
         if len(names) <= 1:
             return
@@ -259,10 +341,8 @@ class Ps5KbmApp:
         nxt = names[(index + 1) % len(names)]
         if self._mapper.set_mode(nxt):
             self._config.current_mode = nxt
-            label = self._mode_label(nxt)
-            self._overlay.set_mode_text(label)
+            # 本方法跑在监听线程上：界面刷新与日志都丢回主线程做
             self._ui_queue.put(("mode", nxt))
-            self._append_log(f"切换到模式：{label}")
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -280,14 +360,14 @@ class Ps5KbmApp:
         content.pack(side="left", fill="both", expand=True, padx=(T.S4, 0))
         self._pages = {
             "connect": connect_ui.build_connect_page(self, content),
-            "mapping": ui_pages.build_mapping_page(self, content),
-            "run": ui_pages.build_run_page(self, content),
+            "mapping": mapping_ui.build_mapping_page(self, content),
+            "run": run_ui.build_run_page(self, content),
         }
         for page in self._pages.values():
             page.pack_forget()
 
         ui_pages.build_log_panel(self, self.root)
-        ui_pages.refresh_mapping_list(self)
+        mapping_ui.refresh_mapping_list(self)
         self.show_page("connect")
         # 已配对 → 先进快捷视图并立刻检测局域网；没配对 → 保持完整流程
         self._probe_state = (
@@ -298,6 +378,19 @@ class Ps5KbmApp:
         if self._paired is not None:
             # 等界面画完再发探测，避免首帧卡在加载状态
             self.root.after(120, self._start_probe)
+        # 页面是固定布局（不滚动），窗口缩得比默认尺寸小会把下面内容裁掉
+        self._lock_min_window_size()
+
+    def _lock_min_window_size(self) -> None:
+        """把最小窗口尺寸锁在默认尺寸，避免缩放后固定布局被裁。
+
+        注意传的是逻辑尺寸：CTk 的 minsize 会再乘一次窗口缩放，
+        传物理像素会导致最小尺寸被放大 1.5 倍（窗口反而被撑大）。
+        """
+        try:
+            self.root.minsize(T.WINDOW_WIDTH, T.WINDOW_HEIGHT)
+        except tk.TclError:
+            pass
 
     def show_page(self, name: str) -> None:
         for page in self._pages.values():
@@ -316,6 +409,14 @@ class Ps5KbmApp:
         self._run_subtitle.configure(text=subtitle)
 
     def _apply_capture_state(self, capturing: bool) -> None:
+        if capturing and self._bridge is None:
+            # 没有会话时不允许进捕获：F8 在断开后仍可能被按到，必须挡住，
+            # 否则会铺一层全屏透明层 + 藏鼠标，却没有地方发送输入。
+            self._source.set_capturing(False)
+            self._append_log("还没有连接主机，先到「连接」页建立会话")
+            return
+        # 界面状态是唯一事实来源：不管从哪条路径进来，输入层都对齐到这里
+        self._source.set_capturing(capturing)
         self._capture_button.configure(text="停止捕获" if capturing else "开始捕获")
         self._trace(f"capture = {capturing}")
         if capturing:
@@ -574,6 +675,11 @@ class Ps5KbmApp:
         future.add_done_callback(lambda fut: self.root.after(0, self._on_connected, fut))
 
     async def _connect_async(self) -> bridge.Ps5Bridge:
+        # 上一个会话可能还在后台关闭：等它收尾再连，避免 PS5 上残留两条会话
+        for _ in range(80):
+            if not self._closing:
+                break
+            await asyncio.sleep(0.1)
         if not os.path.exists(self._config.credentials_path):
             raise FileNotFoundError(
                 f"找不到配对凭据：{self._config.credentials_path}\n"
@@ -607,6 +713,10 @@ class Ps5KbmApp:
         self._probe_state = flow.STATE_ONLINE
         self._probe_error = ""
         self._refresh_paired()
+        # 界面上的扳机深度是连接前就调好的，连上后要下发给新会话，
+        # 否则滑条显示 0.6、实际按 R2 还是满按。
+        self._bridge.set_r2_depth(float(self._config.r2_depth))
+        self._bridge.set_l2_depth(float(self._config.l2_depth))
         self._set_pill(f"已连接 · {self._bridge.host}", T.OK)
         self._set_run_state("已连接", "点「开始捕获」把键鼠交给 PS5")
         self._capture_button.configure(state="normal")
@@ -628,13 +738,11 @@ class Ps5KbmApp:
         self._stop_tick_loop()
         if self._source.capturing:
             self._source.toggle_capture()
-        if ps5 is not None:
-            # 关闭会话并等它完成，避免 PS5 端留下“另一个会话还连着”的残留
-            try:
-                future = asyncio.run_coroutine_threadsafe(ps5.close(), self._loop)
-                future.result(timeout=8)
-            except Exception as exc:  # noqa: BLE001 - 关闭失败不影响本地状态
-                self._append_log(f"关闭会话时出错：{exc}")
+        if self._source_ready:
+            # 监听一起停掉：否则 F8 全局热键还挂着，断开后按下去会进一个
+            # 没有会话的捕获态（覆盖层铺满屏幕、鼠标被藏起来）。
+            self._source.stop()
+            self._source_ready = False
         self._apply_capture_state(False)
         self._set_run_state("会话已断开", "回「连接」页重新连接")
         self._capture_button.configure(state="disabled")
@@ -643,6 +751,26 @@ class Ps5KbmApp:
         connect_ui.show_view(self, flow.initial_view(self._paired))
         connect_ui.render(self)
         self._append_log("已断开")
+        if ps5 is not None:
+            # 关闭会话本身放到后台：在界面线程等它会把窗口卡住好几秒
+            self._closing = True
+            future = asyncio.run_coroutine_threadsafe(
+                self._close_session(ps5), self._loop
+            )
+            future.add_done_callback(self._on_session_closed)
+
+    async def _close_session(self, ps5) -> None:
+        """后台关闭会话，失败只记日志（本方法跑在 asyncio 线程）。"""
+        logger = logging.getLogger(__name__)
+        try:
+            await asyncio.wait_for(ps5.close(), 12)
+        except Exception as exc:  # noqa: BLE001 - 关闭失败不影响本地状态
+            logger.warning("关闭会话时出错：%s", exc)
+
+    def _on_session_closed(self, _future) -> None:
+        """会话关闭完成（asyncio 线程）：只改标志与日志，不碰界面。"""
+        self._closing = False
+        logging.getLogger(__name__).info("会话已关闭")
 
     # ------------------------------------------------------------ 运行循环
     async def _tick_loop(self) -> None:
@@ -719,6 +847,9 @@ class Ps5KbmApp:
             self._tick_task = None
 
     def _toggle_capture(self) -> None:
+        if self._bridge is None:
+            self._append_log("还没有连接主机，先到「连接」页建立会话")
+            return
         state = self._source.toggle_capture()
         self._apply_capture_state(state)
 
@@ -760,7 +891,7 @@ class Ps5KbmApp:
             store[name] = value
             self._rebuild_mapper()
             self._persist()
-            ui_pages.refresh_mapping_list(self)
+            mapping_ui.refresh_mapping_list(self)
 
         ActionEditor(self.root, source, store[name], save)
 
@@ -771,7 +902,111 @@ class Ps5KbmApp:
         store.pop(name, None)
         self._rebuild_mapper()
         self._persist()
-        ui_pages.refresh_mapping_list(self)
+        mapping_ui.refresh_mapping_list(self)
+
+    def rebind_mapping(self, source: str) -> None:
+        """把一条映射的来源键换成新捕获的键（动作保持不变）。"""
+        category, name = self._split_source(source)
+        mode = self._mode_cfg()
+        store = mode.mouse_buttons if category == "mouse" else mode.keyboard_buttons
+        if name not in store:
+            return
+
+        def on_captured(new_source: str | None) -> None:
+            if not new_source or new_source == source:
+                return
+            reason = self._hotkey_reason(new_source)
+            if reason:
+                messagebox.showwarning(
+                    "这个键不能用",
+                    f"{display_key(new_source)} 是{reason}，换一个键吧。",
+                )
+                return
+            blocked = self._mapping_key_conflict(new_source)
+            if blocked and not messagebox.askyesno(
+                "这个键会被抢占",
+                f"{display_key(new_source)} 是{blocked}，捕获时按下会先触发它，"
+                "这条映射不会生效。仍然绑到它上面？",
+            ):
+                return
+            new_category, new_name = self._split_source(new_source)
+            target = (
+                mode.mouse_buttons
+                if new_category == "mouse"
+                else mode.keyboard_buttons
+            )
+            if new_name in target and not messagebox.askyesno(
+                "键位已被占用",
+                f"{display_key(new_source)} 已经绑定了「{describe_action(target[new_name])}」，"
+                "用当前动作覆盖它？",
+            ):
+                return
+            value = store.pop(name)
+            target[new_name] = value
+            self._rebuild_mapper()
+            self._persist()
+            mapping_ui.refresh_mapping_list(self)
+            self._append_log(
+                f"映射已改键：{display_key(source)} → {display_key(new_source)}"
+            )
+
+        KeyCaptureDialog(self.root, on_captured)
+
+    def _stick_source_keys(self, mode=None) -> list[str]:
+        """当前模式里被左摇杆方向占用掉的键。"""
+        sticks = (mode or self._mode_cfg()).keyboard_sticks
+        return [str(key).lower() for keys in sticks.values() for key in keys]
+
+    def _binding_sources(self, mode=None) -> list[str]:
+        """当前模式里已经被映射占用的键（鼠标统一带 mouse_ 前缀）。"""
+        target = mode or self._mode_cfg()
+        sources = [str(key).lower() for key in target.keyboard_buttons]
+        sources += [f"mouse_{str(name).lower()}" for name in target.mouse_buttons]
+        return sources
+
+    def _hotkey_reason(self, source: str) -> str:
+        """映射唯一硬禁的键：捕获热键。捕获中按它只会开关捕获，永远轮不到映射。"""
+        if str(source or "").strip().lower() == self._config.hotkey:
+            return "捕获热键"
+        return ""
+
+    def _mapping_key_conflict(self, source: str) -> str:
+        """映射来源键的「软冲突」：允许绑，但捕获时会先被别的功能吃掉。
+
+        只查模式切换键和扳机调参键——它们在输入层被优先处理，映射永远不触发，
+        所以绑之前问一句。方向键不在此列：一个键同时走路和按键是正常玩法。
+        """
+        return config.key_conflict(
+            source,
+            mode_switch=self._config.mode_switch,
+            trigger_keys=config.trigger_adjust_keys(self._config),
+        )
+
+    def _global_key_conflict(
+        self,
+        source: str,
+        *,
+        ignore_mode_switch: str = "",
+        ignore_trigger: str = "",
+    ) -> str:
+        """改调参键 / 切换键时用：比映射更严，已经映射出去的键也算冲突。"""
+        return config.key_conflict(
+            source,
+            hotkey=self._config.hotkey,
+            mode_switch=self._config.mode_switch,
+            trigger_keys=config.trigger_adjust_keys(self._config),
+            stick_keys=self._stick_source_keys(),
+            mapping_sources=self._binding_sources(),
+            ignore_mode_switch=ignore_mode_switch,
+            ignore_trigger=ignore_trigger,
+        )
+
+    def _note_stick_share(self, source: str) -> None:
+        """同一个键既是方向键又是映射时给条日志：两个动作会同时发生。"""
+        if str(source or "").strip().lower() in self._stick_source_keys():
+            self._append_log(
+                f"{display_key(source)} 同时是左摇杆方向键，捕获时两个动作都会触发"
+            )
 
     def _add_mapping(self) -> None:
         """先弹按键捕获框，识别出键名后再选动作类型。"""
@@ -779,8 +1014,30 @@ class Ps5KbmApp:
         def on_captured(source: str | None) -> None:
             if not source:
                 return
+            reason = self._hotkey_reason(source)
+            if reason:
+                messagebox.showwarning(
+                    "这个键不能用",
+                    f"{display_key(source)} 是{reason}，换一个键吧。",
+                )
+                return
+            blocked = self._mapping_key_conflict(source)
+            if blocked and not messagebox.askyesno(
+                "这个键会被抢占",
+                f"{display_key(source)} 是{blocked}，捕获时按下会先触发它，"
+                "这条映射不会生效。仍然添加？",
+            ):
+                return
             category, name = self._split_source(source)
             mode = self._mode_cfg()
+            target = mode.mouse_buttons if category == "mouse" else mode.keyboard_buttons
+            if name in target and not messagebox.askyesno(
+                "键位已被占用",
+                f"{display_key(source)} 已经绑定了「{describe_action(target[name])}」，"
+                "用新动作覆盖它？",
+            ):
+                return
+            self._note_stick_share(source)
 
             def save(value) -> None:
                 if category == "mouse":
@@ -789,7 +1046,7 @@ class Ps5KbmApp:
                     mode.keyboard_buttons[name] = value
                 self._rebuild_mapper()
                 self._persist()
-                ui_pages.refresh_mapping_list(self)
+                mapping_ui.refresh_mapping_list(self)
 
             ActionEditor(self.root, source, "CROSS", save)
 
@@ -805,7 +1062,7 @@ class Ps5KbmApp:
         self._mode_cfg().keyboard_sticks = sticks
         self._rebuild_mapper()
         self._persist()
-        ui_pages.refresh_stick_keys(self)
+        mapping_ui.refresh_stick_keys(self)
         self._append_log("左摇杆方向键已更新")
 
     def _toggle_mouse_view(self) -> None:
@@ -900,6 +1157,7 @@ class Ps5KbmApp:
     def _apply_r2(self, value: float) -> None:
         """设定 R2 按下时的输出深度（0~1），不直接发送。"""
         depth = max(0.0, min(1.0, float(value)))
+        self._config.r2_depth = depth
         try:
             self._r2_var.set(depth)
         except Exception:  # noqa: BLE001 - 滑条未创建时忽略
@@ -911,6 +1169,7 @@ class Ps5KbmApp:
     def _apply_l2(self, value: float) -> None:
         """设定 L2 按下时的输出深度（0~1），不直接发送。"""
         depth = max(0.0, min(1.0, float(value)))
+        self._config.l2_depth = depth
         try:
             self._l2_var.set(depth)
         except Exception:  # noqa: BLE001 - 滑条未创建时忽略
@@ -919,65 +1178,195 @@ class Ps5KbmApp:
         if self._bridge is not None:
             self._bridge.set_l2_depth(depth)
 
-    def _on_l2_adjust(self, direction: int) -> None:
-        """键盘 - / = 调整 L2 输出深度：每按一次 0.1。"""
-        try:
-            current = float(self._l2_var.get())
-        except Exception:  # noqa: BLE001
-            current = 1.0
-        depth = max(0.0, min(1.0, current + direction * 0.1))
-        self._apply_l2(depth)
-        self._overlay.show_notice(f"L2 {depth:.1f}")
+    def _on_adjust(self, action: str) -> None:
+        """调参键回调（跑在监听线程）：只入队，Tk 操作回界面线程做。"""
+        self._ui_queue.put(("adjust", action))
 
-    def _on_wheel(self, dy: int) -> None:
-        """滚轮调整 R2 输出深度：每格 0.1，右上角显示当前设定值。"""
+    def _apply_adjust(self, action: str) -> None:
+        """按绑定的调参键改扳机深度：每按一次 0.1，右上角提示当前值。"""
+        target = "r2" if action.startswith("r2") else "l2"
+        step = 0.1 if action.endswith("_up") else -0.1
+        variable = self._r2_var if target == "r2" else self._l2_var
         try:
-            current = float(self._r2_var.get())
-        except Exception:  # noqa: BLE001
+            current = float(variable.get())
+        except Exception:  # noqa: BLE001 - 控件没建好时按默认满按算
             current = 1.0
-        depth = max(0.0, min(1.0, current + dy * 0.1))
-        self._apply_r2(depth)
-        self._overlay.show_notice(f"R2 {depth:.1f}")
+        depth = max(0.0, min(1.0, current + step))
+        if target == "r2":
+            self._apply_r2(depth)
+        else:
+            self._apply_l2(depth)
+        self._overlay.show_notice(f"{target.upper()} {depth:.1f}")
+        # 按键改的深度也要落盘，否则重启就回到 1.0
+        self._persist()
 
-    def _send_trigger(self) -> None:
-        """扳机深度变化后强制发一帧，让 PS5 立刻收到。"""
-        if self._bridge is None:
-            return
-        try:
-            self._bridge.force_send_sticks()
-        except Exception:  # noqa: BLE001 - 发送失败不影响 UI
-            pass
+    def _rebind_trigger(self, action: str) -> None:
+        """改调参键：捕获到新键后写进 config.json，并同步给输入层。"""
+
+        def on_captured(name: str | None) -> None:
+            if not name:
+                return
+            reason = self._global_key_conflict(name, ignore_trigger=action)
+            if reason:
+                messagebox.showwarning(
+                    "这个键不能用",
+                    f"{display_key(name)} 是{reason}，换一个键吧。",
+                )
+                return
+            setattr(self._config, action, name)
+            self._source.set_trigger_adjust(
+                config.trigger_adjust_keys(self._config), self._on_adjust
+            )
+            self._persist()
+            run_tuning_ui.refresh_trigger_buttons(self)
+            self._append_log(
+                f"{run_tuning_ui.trigger_label(action)} 调参键：{display_key(name)}"
+            )
+
+        KeyCaptureDialog(self.root, on_captured, allow_wheel=True)
 
     def _commit_sliders(self, _event=None) -> None:
         """滑块松开后才写盘，避免拖动过程中反复 IO 卡顿。"""
         self._persist()
 
-    def save_as_preset(self) -> None:
-        """把当前映射回写成预设文件，覆盖用户目录里的同名预设。"""
-        name = self._preset_var.get().strip()
-        if not name:
-            messagebox.showwarning("提示", "先在上面的下拉框选择要覆盖的预设名")
+    def create_preset(self) -> None:
+        """新建一个空预设：只有一个「默认」模式，映射全空，建完直接切过去。"""
+        dialog = ctk.CTkInputDialog(
+            text="新预设名称（映射为空，默认只有一个「默认」模式）",
+            title="新建预设",
+        )
+        raw = dialog.get_input()
+        if raw is None:
             return
-        if not messagebox.askyesno(
-            "确认覆盖",
-            f"用当前映射覆盖预设「{name}」？\n\n以后点「应用预设」会加载这一套。",
+        try:
+            name = config.check_preset_name(raw)
+        except ValueError as exc:
+            messagebox.showwarning("名称不可用", str(exc))
+            return
+        if config.is_user_preset(name) or name in config.list_presets():
+            messagebox.showwarning(
+                "预设已存在",
+                f"「{name}」已经存在，换个名字吧。\n要复用当前配置可以用「另存为…」。",
+            )
+            return
+        try:
+            # 空映射，但沿用当前的热键 / 切换键 / 调参键 / 目标窗口，
+            # 否则新建预设会把用户的切换键悄悄换回默认 F9
+            path = config.save_preset(
+                name, config.new_empty_config(name, self._config)
+            )
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("新建失败", str(exc))
+            return
+        self._refresh_preset_list(select=name)
+        self.apply_preset(name)
+        self._append_log(f"已新建空预设：{path}")
+
+    def save_as_preset(self) -> None:
+        """把当前整套配置（含所有模式）另存为一份预设副本。"""
+        dialog = ctk.CTkInputDialog(
+            text="预设名称（例如其他游戏名）\n会给当前所有模式单独存一套",
+            title="新建 / 另存为预设",
+        )
+        raw = dialog.get_input()
+        if raw is None:
+            return
+        try:
+            name = config.check_preset_name(raw)
+        except ValueError as exc:
+            messagebox.showwarning("名称不可用", str(exc))
+            return
+        if config.is_user_preset(name) and not messagebox.askyesno(
+            "确认覆盖", f"预设「{name}」已存在，用当前配置覆盖它？"
         ):
             return
         try:
             path = config.save_preset(name, self._config)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             messagebox.showerror("保存失败", str(exc))
             return
-        self._preset_values = config.list_presets()
-        self._preset_box.configure(values=self._preset_values)
-        self._append_log(f"预设已更新：{path}")
+        self._config.preset = name
+        self._refresh_preset_list(select=name)
+        self._preset_owner = name
+        self._persist()
+        self._append_log(f"预设已保存：{path}")
 
-    def _apply_preset(self) -> None:
-        preset = self._preset_var.get()
+    def remove_preset(self) -> None:
+        """删除用户预设文件（内置预设不能删）。"""
+        name = self._preset_var.get().strip()
+        if not name:
+            messagebox.showwarning("提示", "先在上面的下拉框选择要删除的预设")
+            return
+        if not config.is_user_preset(name):
+            messagebox.showinfo(
+                "内置预设",
+                f"「{name}」是内置预设，不能删除。\n需要改动时可以「另存为」一个新名字。",
+            )
+            return
+        deleting_current = self._config.preset == name
+        if not messagebox.askyesno(
+            "确认删除",
+            f"删除用户预设「{name}」？\n\n只删 presets\\{name}.json"
+            + ("，并切换到另一个可用预设。" if deleting_current else "。"),
+        ):
+            return
+        try:
+            path = config.delete_preset(name)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("删除失败", str(exc))
+            return
+        if deleting_current:
+            # 关键：删的是当前预设时必须真正加载回落的那一套，不能只改名字。
+            # 否则旧 modes 会被 _persist 当成新预设的内容写盘，把另一个预设覆盖成空的。
+            self._preset_owner = ""
+            remaining = [item for item in config.list_presets() if item != name]
+            self._refresh_preset_list()
+            if remaining:
+                self.apply_preset(remaining[0])
+            else:
+                self._config.preset = ""
+                self._persist()
+                mapping_ui.refresh_mapping_list(self)
+                mapping_ui.refresh_stick_keys(self)
+                mapping_ui.refresh_mode_ui(self)
+        else:
+            self._refresh_preset_list()
+        self._append_log(f"预设已删除：{path}")
+
+    def _refresh_preset_list(self, select: str | None = None) -> None:
+        """重新读预设目录，刷新下拉选项（新建 / 删除 / 应用后调用）。"""
+        self._preset_values = config.list_presets()
+        if select:
+            self._preset_var.set(select)
+        elif self._preset_var.get() not in self._preset_values and self._preset_values:
+            self._preset_var.set(self._preset_values[0])
+        if getattr(self, "_preset_box", None) is not None:
+            self._preset_box.configure(values=self._preset_values)
+
+    def _restore_preset_selection(self) -> None:
+        """预设读取失败后，把下拉框拉回实际生效的那个，避免「显示 A 实际 B」。"""
+        self._refresh_preset_list()
+        if self._config.preset and self._config.preset in self._preset_values:
+            self._preset_var.set(self._config.preset)
+
+    def apply_preset(self, name: str | None = None) -> None:
+        """应用预设：下拉选中或新建后直接调用，不再需要单独的「应用」按钮。"""
+        preset = (name or self._preset_var.get() or "").strip()
+        if not preset:
+            return
         try:
             raw = config.load_preset(preset)
         except FileNotFoundError as exc:
             messagebox.showerror("错误", str(exc))
+            self._restore_preset_selection()
+            return
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror(
+                "预设读取失败",
+                f"预设「{preset}」的文件读不出来：\n{exc}\n\n"
+                "它可能被改坏了，可以删掉这个预设文件或换个预设。",
+            )
+            self._restore_preset_selection()
             return
         built = config.build_config(raw)
         self._config.preset = preset
@@ -987,15 +1376,21 @@ class Ps5KbmApp:
         # 应用预设只换键位映射，用户调好的灵敏度/死区/平滑必须保持不变。
         self._config.current_mode = "default"
         self._edit_mode = "default"
+        self._preset_var.set(preset)
+        self._preset_owner = preset
         self._rebuild_mapper()
         self._persist()
-        ui_pages.refresh_mapping_list(self)
-        ui_pages.refresh_stick_keys(self)
-        ui_pages.refresh_mode_ui(self)
+        mapping_ui.refresh_mapping_list(self)
+        mapping_ui.refresh_stick_keys(self)
+        mapping_ui.refresh_mode_ui(self)
         self._append_log(f"已应用预设：{preset}")
 
     def _persist(self) -> None:
-        """编辑后立即写盘：config.json 存映射，tuning.json 存摇杆手感参数。"""
+        """编辑后立即写盘：config.json 存映射，tuning.json 存摇杆手感参数。
+
+        当前预设如果是用户自己新建的，也同步写回预设文件（内置预设只读，不覆盖），
+        这样切换来切换去不会丢掉改过的键位。
+        """
         try:
             config.save_config(self._config)
         except OSError as exc:
@@ -1005,12 +1400,15 @@ class Ps5KbmApp:
             config.save_tuning(self._config)
         except OSError as exc:
             self._append_log(f"手感参数保存失败：{exc}")
-
-    def _save_config(self) -> None:
-        self._config.current_mode = self._mapper.mode
-        self._persist()
-        self._rebuild_mapper()
-        self._append_log("配置已保存到 config.json")
+        if (
+            self._config.preset
+            and self._config.preset == getattr(self, "_preset_owner", "")
+            and config.is_user_preset(self._config.preset)
+        ):
+            try:
+                config.save_preset(self._config.preset, self._config)
+            except (OSError, ValueError) as exc:
+                self._append_log(f"预设保存失败：{exc}")
 
     def _rebuild_mapper(self) -> None:
         was_capturing = self._source.capturing and self._source_ready
@@ -1022,19 +1420,28 @@ class Ps5KbmApp:
         self._source.set_capture_callback(self._on_capture_changed)
         self._source.set_key_callback(self._on_key_event)
         self._source.set_mode_switch(self._config.mode_switch, self._on_mode_switch)
-        self._source.set_scroll_callback(self._on_wheel)
-        self._source.set_l2_adjust_callback(self._on_l2_adjust)
+        self._source.set_trigger_adjust(
+            config.trigger_adjust_keys(self._config), self._on_adjust
+        )
         self._source_ready = False
         if self._bridge is not None:
             self._source.start()
             self._source_ready = True
         if was_capturing:
-            self._append_log("配置已更新，重新开始捕获后生效")
+            # 捕获中改了映射：重建后必须把捕获接回去，否则覆盖层还开着、
+            # 按钮还写着「停止捕获」，实际输入却已经断了。
+            self._source.set_capturing(True)
+            self._apply_capture_state(True)
+            self._append_log("配置已更新，捕获已自动恢复")
 
     # ------------------------------------------------------------ 杂项
     def _append_log(self, text: str) -> None:
         self._log_text.configure(state="normal")
         self._log_text.insert("end", text + "\n")
+        # 长时间挂着日志会无限变长（内存与滚动都越来越慢），超过上限裁掉最旧的
+        lines = int(self._log_text.index("end-1c").split(".")[0])
+        if lines > LOG_MAX_LINES:
+            self._log_text.delete("1.0", f"{lines - LOG_MAX_LINES + 1}.0")
         self._log_text.see("end")
         self._log_text.configure(state="disabled")
 
@@ -1062,9 +1469,14 @@ class Ps5KbmApp:
                     self._apply_stick_pair(value)
                 elif kind == "key":
                     self._apply_key_state(value)
+                elif kind == "adjust":
+                    self._apply_adjust(value)
                 elif kind == "mode":
                     self._edit_mode = value
                     self._refresh_mode_ui()
+                    label = self._mode_label(value)
+                    self._overlay.set_mode_text(label)
+                    self._append_log(f"切换到模式：{label}")
         except queue.Empty:
             pass
         self.root.after(120, self._poll_events)

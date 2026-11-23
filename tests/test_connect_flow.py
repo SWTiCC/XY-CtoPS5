@@ -118,7 +118,8 @@ class DescribeTests(unittest.TestCase):
         view = flow.describe(self.paired, flow.STATE_ERROR, probe_error="检测超时")
         self.assertEqual(view.tone, flow.TONE_ERR)
         self.assertIn("检测超时", view.status_text)
-        self.assertFalse(view.can_connect)
+        # 检测失败不等于连不上（超时 / 本地端口冲突都会走到这里），仍允许直接连接
+        self.assertTrue(view.can_connect)
         self.assertTrue(view.can_recheck)
 
     def test_connect_error_allows_retry(self):

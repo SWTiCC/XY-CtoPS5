@@ -141,6 +141,7 @@ class CaptureOverlay:
         _LOGGER.info("捕获覆盖层已打开（全屏透明置顶、鼠标指针隐藏）")
 
     def hide(self) -> None:
+        was_active = self._win is not None
         if self._timer is not None:
             try:
                 self._root.after_cancel(self._timer)
@@ -169,7 +170,8 @@ class CaptureOverlay:
         self._badge = None
         self._badge_label = None
         self._win = None
-        _LOGGER.info("捕获覆盖层已关闭")
+        if was_active:
+            _LOGGER.info("捕获覆盖层已关闭")
 
     def _keep_focus(self) -> None:
         win = self._win

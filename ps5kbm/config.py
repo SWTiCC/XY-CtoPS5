@@ -10,9 +10,12 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import sys
 from dataclasses import dataclass, field, fields
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _app_root() -> str:
@@ -49,6 +52,77 @@ DEFAULT_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.json")
 # 摇杆/鼠标手感参数单独存这个文件：改一下就保存，应用预设时也不会被覆盖
 TUNING_CONFIG_PATH = os.path.join(PROJECT_ROOT, "tuning.json")
 DEFAULT_CREDENTIALS_PATH = os.path.join(PROJECT_ROOT, "credentials.json")
+
+# 捕获时调整扳机输出深度的按键：动作 → 默认键名。
+# 键名约定同映射（见 keys.py），另外支持 wheel_up / wheel_down（鼠标滚轮）。
+TRIGGER_KEY_DEFAULTS = {
+    "r2_up": "wheel_up",
+    "r2_down": "wheel_down",
+    "l2_up": "=",
+    "l2_down": "-",
+}
+
+# 四个调参动作的界面名：日志、按钮、冲突提示共用一份，避免各写一遍
+TRIGGER_LABELS = {
+    "r2_up": "R2 加深",
+    "r2_down": "R2 减浅",
+    "l2_up": "L2 加深",
+    "l2_down": "L2 减浅",
+}
+
+
+def trigger_adjust_keys(cfg: "AppConfig") -> dict[str, str]:
+    """返回当前配置的四个调参键；空值回落到默认，顺序固定便于匹配。"""
+    return {
+        name: str(getattr(cfg, name, "") or "").strip().lower()
+        or default
+        for name, default in TRIGGER_KEY_DEFAULTS.items()
+    }
+
+
+def _normalize_key(name: object) -> str:
+    return str(name or "").strip().lower()
+
+
+def key_conflict(
+    name: str,
+    *,
+    hotkey: str = "",
+    mode_switch: str = "",
+    trigger_keys: dict[str, str] | None = None,
+    stick_keys: tuple[str, ...] | list[str] = (),
+    mapping_sources: tuple[str, ...] | list[str] = (),
+    ignore_mode_switch: str = "",
+    ignore_trigger: str = "",
+) -> str:
+    """按键是否已被别处占用：被占用返回中文原因，可用返回空串。
+
+    所有「占一个键」的地方（映射、调参键、切换键）共用这份判定，
+    以后新增占用类型只改这里。判定顺序固定：热键 → 切换键 → 调参键 →
+    方向键 → 已映射按键。
+
+    `ignore_*` 用于「改键改回自己」时不算冲突。
+    """
+
+    key = _normalize_key(name)
+    if not key:
+        return ""
+    if hotkey and key == _normalize_key(hotkey):
+        return "捕获热键"
+    if mode_switch:
+        current = _normalize_key(mode_switch)
+        if key == current and key != _normalize_key(ignore_mode_switch):
+            return "模式切换键"
+    for action, value in (trigger_keys or {}).items():
+        if action == ignore_trigger:
+            continue
+        if key == _normalize_key(value):
+            return f"扳机调参键（{TRIGGER_LABELS.get(action, action)}）"
+    if key in {_normalize_key(item) for item in stick_keys}:
+        return "左摇杆方向键"
+    if key in {_normalize_key(item) for item in mapping_sources}:
+        return "已映射的按键"
+    return ""
 
 
 @dataclass
@@ -125,6 +199,11 @@ class AppConfig:
     preset: str = "gta6"
     hotkey: str = "f8"
     mode_switch: str = "f9"
+    # 捕获时调扳机深度的四个键（默认沿用旧行为：滚轮调 R2，- / = 调 L2）
+    r2_up: str = TRIGGER_KEY_DEFAULTS["r2_up"]
+    r2_down: str = TRIGGER_KEY_DEFAULTS["r2_down"]
+    l2_up: str = TRIGGER_KEY_DEFAULTS["l2_up"]
+    l2_down: str = TRIGGER_KEY_DEFAULTS["l2_down"]
     ps5_host: str = ""
     account_id: str = ""
     credentials_path: str = DEFAULT_CREDENTIALS_PATH
@@ -132,6 +211,9 @@ class AppConfig:
     left_stick: LeftStickConfig = field(default_factory=LeftStickConfig)
     # 开始捕获时自动切到前台的窗口标题（空 = 不切换，由透明层保持焦点）
     target_window: str = ""
+    # 按下扳机时输出的深度（0~1）：运行页滑条/调参键改的就是它，存 tuning.json
+    r2_depth: float = 1.0
+    l2_depth: float = 1.0
     # 多模式映射：键是模式 id，至少包含 "default"
     modes: dict[str, ModeConfig] = field(default_factory=dict)
     current_mode: str = "default"
@@ -195,12 +277,85 @@ def preset_to_dict(name: str, cfg: AppConfig) -> dict:
     }
 
 
+def new_empty_config(preset_name: str, base: AppConfig | None = None) -> AppConfig:
+    """新建预设用的空配置：只有一个「默认」模式，三组映射都为空。
+
+    传入 base 时沿用它的**非映射**设置（热键 / 切换键 / 调参键 / 目标窗口 /
+    手感与扳机深度）。否则新建一个预设会把用户的切换键悄悄重置成默认 F9。
+    """
+    cfg = AppConfig(
+        preset=str(preset_name),
+        modes={"default": ModeConfig(label="默认")},
+    )
+    if base is not None:
+        cfg.hotkey = base.hotkey
+        cfg.mode_switch = base.mode_switch
+        cfg.r2_up = base.r2_up
+        cfg.r2_down = base.r2_down
+        cfg.l2_up = base.l2_up
+        cfg.l2_down = base.l2_down
+        cfg.target_window = base.target_window
+        cfg.r2_depth = base.r2_depth
+        cfg.l2_depth = base.l2_depth
+        cfg.mouse = copy.deepcopy(base.mouse)
+        cfg.left_stick = copy.deepcopy(base.left_stick)
+    return cfg
+
+
+def _write_json(path: str, data: dict) -> None:
+    """原子写：先写临时文件再替换。
+
+    直接 open(path, "w") 写到一半断电/崩溃会留下半截 JSON，
+    下次启动直接解析失败（用户看到的就是「程序打不开」）。
+    """
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
 def save_preset(name: str, cfg: AppConfig) -> str:
     """把当前配置写回用户预设目录，返回写入路径。"""
+    name = check_preset_name(name)
     os.makedirs(USER_PRESETS_DIR, exist_ok=True)
     path = os.path.join(USER_PRESETS_DIR, f"{name}.json")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(preset_to_dict(name, cfg), handle, ensure_ascii=False, indent=2)
+    _write_json(path, preset_to_dict(name, cfg))
+    return path
+
+
+_INVALID_PRESET_CHARS = set('\\/:*?"<>|')
+
+
+def check_preset_name(raw: str) -> str:
+    """校验预设名：不能为空、不能含路径字符；返回去空格后的名字。"""
+    name = str(raw or "").strip()
+    if not name:
+        raise ValueError("预设名不能为空")
+    if len(name) > 40:
+        raise ValueError("预设名太长（最多 40 个字符）")
+    if any(char in _INVALID_PRESET_CHARS for char in name):
+        raise ValueError('预设名不能包含 \\ / : * ? " < > |')
+    return name
+
+
+def user_preset_path(name: str) -> str:
+    return os.path.join(USER_PRESETS_DIR, f"{check_preset_name(name)}.json")
+
+
+def is_user_preset(name: str) -> bool:
+    """是否已经存在同名的用户预设（内置预设不可覆盖 / 删除）。"""
+    try:
+        return os.path.exists(user_preset_path(name))
+    except ValueError:
+        return False
+
+
+def delete_preset(name: str) -> str:
+    """删除用户预设文件；内置预设没有用户文件，调用方应先判断。"""
+    path = user_preset_path(name)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"用户预设 {name} 不存在")
+    os.remove(path)
     return path
 
 
@@ -241,6 +396,14 @@ def build_left_stick(raw: dict) -> LeftStickConfig:
     )
 
 
+def _clamp01(value: object, default: float = 1.0) -> float:
+    """0~1 的浮点参数：越界夹紧，非法值用默认。"""
+    try:
+        return max(0.0, min(1.0, float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
 def _build_mouse(raw: dict) -> MouseConfig:
     return build_mouse(raw)
 
@@ -278,15 +441,26 @@ def build_config(raw: dict) -> AppConfig:
         preset=str(raw.get("preset", "gta6")),
         hotkey=str(raw.get("hotkey", "f8")).lower(),
         mode_switch=str(raw.get("mode_switch", "f9")).lower(),
+        r2_up=_key_or(raw.get("r2_up"), TRIGGER_KEY_DEFAULTS["r2_up"]),
+        r2_down=_key_or(raw.get("r2_down"), TRIGGER_KEY_DEFAULTS["r2_down"]),
+        l2_up=_key_or(raw.get("l2_up"), TRIGGER_KEY_DEFAULTS["l2_up"]),
+        l2_down=_key_or(raw.get("l2_down"), TRIGGER_KEY_DEFAULTS["l2_down"]),
         ps5_host=str(raw.get("ps5_host", "")),
         account_id=str(raw.get("account_id", "")),
         credentials_path=str(raw.get("credentials_path", DEFAULT_CREDENTIALS_PATH)),
         mouse=_build_mouse(raw.get("mouse", {})),
         left_stick=_build_left_stick(raw.get("left_stick", {})),
         target_window=str(raw.get("target_window", "")),
+        r2_depth=_clamp01(raw.get("r2_depth", 1.0)),
+        l2_depth=_clamp01(raw.get("l2_depth", 1.0)),
         modes=modes,
         current_mode=current,
     )
+
+
+def _key_or(value: object, default: str) -> str:
+    """配置里的键名：去空格转小写，空值用默认。"""
+    return str(value or "").strip().lower() or default
 
 
 def tuning_to_dict(cfg: AppConfig) -> dict:
@@ -314,13 +488,14 @@ def tuning_to_dict(cfg: AppConfig) -> dict:
             "value": cfg.left_stick.value,
             "ramp": cfg.left_stick.ramp,
         },
+        "r2_depth": cfg.r2_depth,
+        "l2_depth": cfg.l2_depth,
     }
 
 
 def save_tuning(cfg: AppConfig, path: str = TUNING_CONFIG_PATH) -> None:
     """保存摇杆/鼠标手感参数（改动即时落盘）。"""
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(tuning_to_dict(cfg), handle, ensure_ascii=False, indent=2)
+    _write_json(path, tuning_to_dict(cfg))
 
 
 def load_tuning(path: str = TUNING_CONFIG_PATH) -> dict:
@@ -332,15 +507,40 @@ def load_tuning(path: str = TUNING_CONFIG_PATH) -> dict:
         return {}
 
 
+def _backup_broken(path: str) -> None:
+    """把读不动的文件改名留档，避免下一次保存把它彻底覆盖掉。"""
+    try:
+        os.replace(path, f"{path}.broken")
+    except OSError:
+        pass
+
+
 def load_config(path: str = DEFAULT_CONFIG_PATH) -> AppConfig:
     """加载配置：预设打底，再用 config.json 覆盖。
 
     注意：映射类字段（按键/鼠标/方向键/modes）在用户配置里出现时**整体替换**，
     不做逐键合并。否则用户在界面里删掉的键会被预设补回来。
+
+    容错：config.json 或预设文件解析失败时不让程序打不开——坏文件改名留档，
+    按能读到的那部分启动（日志里说明原因）。
     """
-    user_raw: dict = _read_json(path) if os.path.exists(path) else {}
+    user_raw: dict = {}
+    if os.path.exists(path):
+        try:
+            user_raw = _read_json(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            _LOGGER.warning("配置文件读取失败，已改名留档并按预设启动：%s", exc)
+            _backup_broken(path)
+            user_raw = {}
     preset_name = str(user_raw.get("preset", "gta6"))
-    preset_raw = load_preset(preset_name)
+    try:
+        preset_raw = load_preset(preset_name)
+    except FileNotFoundError:
+        # 预设文件被删了也能启动：只用用户配置本身，不至于卡在启动
+        preset_raw = {}
+    except (OSError, json.JSONDecodeError) as exc:
+        _LOGGER.warning("预设 %s 读取失败，先只用用户配置启动：%s", preset_name, exc)
+        preset_raw = {}
     merged = _deep_merge(preset_raw, user_raw)
     for field_name in (
         "keyboard_buttons",
@@ -364,16 +564,18 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> AppConfig:
                 **(merged.get("left_stick") or {}),
                 **tuning_stick,
             }
+        for depth_key in ("r2_depth", "l2_depth"):
+            if depth_key in tuning:
+                merged[depth_key] = tuning[depth_key]
     return build_config(merged)
 
 
 def save_default_config(path: str = DEFAULT_CONFIG_PATH) -> None:
-    """写出带注释的默认配置，方便用户直接改。"""
+    """写出默认配置（预设内容打底），方便用户直接改。"""
     preset_raw = load_preset("gta6")
     data = _deep_merge(preset_raw, {"preset": "gta6"})
     data.setdefault("ps5_host", "")
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, ensure_ascii=False, indent=2)
+    _write_json(path, data)
 
 
 def load_credentials(path: str) -> dict:
@@ -381,8 +583,7 @@ def load_credentials(path: str) -> dict:
 
 
 def save_credentials(path: str, credentials: dict) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(credentials, handle, ensure_ascii=False, indent=2)
+    _write_json(path, credentials)
 
 
 def modes_to_dict(cfg: AppConfig) -> dict:
@@ -405,6 +606,10 @@ def config_to_dict(cfg: AppConfig) -> dict:
         "preset": cfg.preset,
         "hotkey": cfg.hotkey,
         "mode_switch": cfg.mode_switch,
+        "r2_up": cfg.r2_up,
+        "r2_down": cfg.r2_down,
+        "l2_up": cfg.l2_up,
+        "l2_down": cfg.l2_down,
         "current_mode": cfg.current_mode,
         "target_window": cfg.target_window,
         "ps5_host": cfg.ps5_host,
@@ -420,6 +625,8 @@ def config_to_dict(cfg: AppConfig) -> dict:
             "value": cfg.left_stick.value,
             "ramp": cfg.left_stick.ramp,
         },
+        "r2_depth": cfg.r2_depth,
+        "l2_depth": cfg.l2_depth,
         # 同时写顶层的 default 映射（兼容旧版读取）和多模式结构
         "keyboard_sticks": default_mode.keyboard_sticks,
         "keyboard_buttons": default_mode.keyboard_buttons,
@@ -429,5 +636,4 @@ def config_to_dict(cfg: AppConfig) -> dict:
 
 
 def save_config(cfg: AppConfig, path: str = DEFAULT_CONFIG_PATH) -> None:
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(config_to_dict(cfg), handle, ensure_ascii=False, indent=2)
+    _write_json(path, config_to_dict(cfg))

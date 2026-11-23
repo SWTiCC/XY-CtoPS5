@@ -3,7 +3,7 @@
 ; Output: dist\XY-CtoPS5-Setup.exe (single-file installer)
 
 #define AppName "XY-CtoPS5"
-#define AppVersion "1.0.0"
+#define AppVersion "0.2.5"
 #define AppExe "XY-CtoPS5.exe"
 #define AppPublisher "XY-CtoPS5"
 

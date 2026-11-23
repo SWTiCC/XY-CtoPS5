@@ -145,9 +145,11 @@ def describe(
         )
     if state == STATE_ERROR:
         detail = probe_error or "未知错误"
+        # 检测失败不代表主机连不上（超时、本地端口被占用等都会走到这里），
+        # 所以照样允许直接连接，别把用户堵在门口。
         return QuickView(
-            title, subtitle, f"检测失败：{detail}", TONE_ERR,
-            can_connect=False, can_disconnect=False, can_recheck=True,
+            title, subtitle, f"检测失败：{detail}（仍可尝试直接连接）", TONE_ERR,
+            can_connect=True, can_disconnect=False, can_recheck=True,
         )
     if state == STATE_CHECKING:
         return QuickView(

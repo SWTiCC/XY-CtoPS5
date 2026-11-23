@@ -38,3 +38,4 @@ build-*/
 video/node_modules/
 video/out/
 video/.cache/
+tests/_tmp/

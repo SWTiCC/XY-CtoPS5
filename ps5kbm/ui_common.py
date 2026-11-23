@@ -134,6 +134,19 @@ class KeyCaptureDialog(ctk.CTkToplevel):
         "Super_L": "cmd",
         "Super_R": "cmd_r",
         "Menu": "menu",
+        # 标点键在 Tk 里是字母 keysym，不映射的话没法绑 - / = 这类键
+        "equal": "=",
+        "plus": "+",
+        "minus": "-",
+        "bracketleft": "[",
+        "bracketright": "]",
+        "semicolon": ";",
+        "apostrophe": "'",
+        "comma": ",",
+        "period": ".",
+        "slash": "/",
+        "backslash": "\\",
+        "grave": "`",
     }
 
     @classmethod
@@ -146,10 +159,10 @@ class KeyCaptureDialog(ctk.CTkToplevel):
             return keysym.lower()
         return None
 
-    def __init__(self, parent, on_captured):
+    def __init__(self, parent, on_captured, allow_wheel: bool = False):
         super().__init__(parent)
         self.title("按下要绑定的按键")
-        self.geometry("400x190")
+        self.geometry("400x190" if not allow_wheel else "400x210")
         self.configure(fg_color=T.BG)
         self.resizable(False, False)
         self._on_captured = on_captured
@@ -160,9 +173,13 @@ class KeyCaptureDialog(ctk.CTkToplevel):
         ctk.CTkLabel(
             frame, text="请按下要绑定的键", font=font(T.LG, bold=True), text_color=T.TEXT
         ).pack(anchor="w")
+        hint = "键盘任意键，或鼠标任意键（含侧键）"
+        if allow_wheel:
+            hint += "\n也可以用鼠标滚轮（上 / 下）"
+        hint += "\nEsc 取消"
         ctk.CTkLabel(
             frame,
-            text="键盘任意键，或鼠标任意键（含侧键）\nEsc 取消",
+            text=hint,
             font=font(T.XS),
             text_color=T.TEXT_DIM,
             justify="left",
@@ -174,7 +191,8 @@ class KeyCaptureDialog(ctk.CTkToplevel):
 
         # 鼠标仍用 pynput（Tk 能收到 Button 事件但侧键支持有限）
         self._ms_listener = mouse.Listener(
-            on_click=lambda x, y, button, pressed: self._on_mouse(button, pressed)
+            on_click=lambda x, y, button, pressed: self._on_mouse(button, pressed),
+            on_scroll=self._on_scroll if allow_wheel else None,
         )
         self._ms_listener.start()
         # 应用级绑定：焦点在对话框或主窗口都能收到，避免“按了没反应”
@@ -201,6 +219,13 @@ class KeyCaptureDialog(ctk.CTkToplevel):
             return
         name = mouse_button_name(button)
         # 回到 Tk 主线程完成 UI 操作
+        self.after(0, lambda: self._finish(name))
+
+    def _on_scroll(self, x, y, dx, dy) -> None:
+        """滚轮捕获（只有 allow_wheel=True 时才挂）：上 / 下各算一个键。"""
+        if self._done:
+            return
+        name = "wheel_up" if dy > 0 else "wheel_down"
         self.after(0, lambda: self._finish(name))
 
     def _finish(self, name: str | None) -> None:
@@ -233,7 +258,7 @@ class StickKeysEditor(ctk.CTkToplevel):
         frame.pack(fill="both", expand=True, padx=T.S6, pady=T.S4)
         ctk.CTkLabel(
             frame,
-            text="WASD 这类方向键映射到左摇杆；留空表示该方向不绑定",
+            text="WASD 这类方向键映射到左摇杆；一个方向可以绑多个键（逗号分隔），留空表示不绑定",
             font=font(T.XS),
             text_color=T.TEXT_FAINT,
             wraplength=340,
@@ -248,7 +273,8 @@ class StickKeysEditor(ctk.CTkToplevel):
                 grid, text=label, font=font(T.SM), text_color=T.TEXT_DIM
             ).grid(row=index // 2, column=(index % 2) * 2, sticky="w", padx=(0, T.S2), pady=T.S2)
             keys = sticks.get(direction, [])
-            var = ctk.StringVar(value=str(keys[0]) if keys else "")
+            # 这里要显示全部键：只显示第一个的话，点保存就把其余键丢了
+            var = ctk.StringVar(value=", ".join(str(key) for key in keys))
             self._vars[direction] = var
             ctk.CTkEntry(
                 grid,
