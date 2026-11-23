@@ -1,0 +1,35 @@
+# XY-CtoPS5 — PS5 键鼠映射工具
+# 本文件保持 ASCII，避免不同编辑器/系统的编码问题
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# 打包产物
+app/
+*.spec
+
+# 用户数据（绝不能提交：含主机 IP、PSN 账号、配对凭据）
+config.json
+credentials.json
+tuning.json
+ps5kbm.log
+ps5kbm.log.*
+app/launch-error.log
+app/stdout.log
+# 用户预设（项目根目录的 presets/，内置预设 ps5kbm/presets 要提交）
+/presets/
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# PyInstaller 其他构建产物
+build-*/

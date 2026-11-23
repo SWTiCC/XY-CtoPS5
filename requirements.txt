@@ -1,0 +1,19 @@
+# 依赖说明：不要直接 `pip install -r requirements.txt`，
+# 请运行 install.ps1（它用 --no-deps 装 playdirector，跳过需要编译的 netifaces，
+# 由 vendor/netifaces.py 提供兼容实现）。
+#
+# 运行时需要的包（install.ps1 已覆盖）：
+playdirector==0.4.2
+aiohttp
+async-timeout
+pyps4-2ndscreen
+cryptography
+pycryptodomex
+protobuf>=4.21.1,<7
+requests
+pyee>=12,<13
+pyyaml
+cffi
+pynput
+psutil
+customtkinter
