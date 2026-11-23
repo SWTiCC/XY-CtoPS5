@@ -1,4 +1,4 @@
-"""运行页的手感调参区：鼠标 → 右摇杆、扳机深度。
+"""运行页的手感调参区：左摇杆过渡、鼠标 → 右摇杆、扳机深度。
 
 单独成模块，避免 run_ui.py 越滚越大；只摆控件，回调都在 app.py。
 """
@@ -35,12 +35,46 @@ def curve_label(value: str) -> str:
     return _CURVE_LABELS.get((value or "linear").lower(), "线性")
 
 
+def build_left_stick(app, parent) -> None:
+    """左摇杆过渡速度：跟在「左摇杆幅度」后面，同一行。
+
+    过渡（ramp）是「WASD 从 0 推到目标幅度要多快」，属于左摇杆；
+    以前放在「鼠标 → 右摇杆」下面，容易让人以为它调的是右摇杆。
+    这里做成一行紧凑控件，不额外占一段高度（运行页本来就刚好一屏）。
+    """
+    app._stick_ramp_var = tk.DoubleVar(value=app._config.left_stick.ramp)
+    ctk.CTkLabel(
+        parent, text="过渡", font=font(T.SM), text_color=T.TEXT_DIM
+    ).pack(side="left", padx=(T.S4, T.S1))
+    slider = ctk.CTkSlider(
+        parent,
+        from_=0.0,
+        to=12.0,
+        number_of_steps=24,
+        variable=app._stick_ramp_var,
+        command=app._apply_stick_ramp,
+        width=110,
+        progress_color=T.ACCENT,
+        button_color=T.TEXT,
+        button_hover_color=T.TEXT,
+    )
+    slider.pack(side="left")
+    # 和别的手感滑条一样：松开才写盘
+    slider.bind("<ButtonRelease-1>", app._commit_sliders, add="+")
+    app._stick_ramp_label = ctk.CTkLabel(
+        parent,
+        text=f"{app._config.left_stick.ramp:.1f}/s",
+        font=font(T.SM),
+        text_color=T.TEXT_DIM,
+    )
+    app._stick_ramp_label.pack(side="left", padx=(T.S1, 0))
+
+
 def build_mouse_tuning(app, parent) -> None:
-    """三列网格排 6 个滑条 + 一行曲线 / 开关，横向不会被窗口裁掉。"""
+    """三列网格排 5 个滑条 + 一行曲线 / 开关，横向不会被窗口裁掉。"""
     divider(parent)
     _section_header(parent, "鼠标 → 右摇杆", "拖动即时生效，松手保存")
 
-    app._stick_ramp_var = tk.DoubleVar(value=app._config.left_stick.ramp)
     app._deadzone_var = tk.DoubleVar(value=app._config.mouse.deadzone)
     app._sens_var = tk.DoubleVar(value=app._config.mouse.sensitivity)
     app._slow_sens_var = tk.DoubleVar(value=app._config.mouse.slow_sensitivity)
@@ -48,17 +82,6 @@ def build_mouse_tuning(app, parent) -> None:
     app._smoothing_var = tk.DoubleVar(value=app._config.mouse.smoothing)
 
     row1 = _grid_row(parent, 3)
-    cell, app._stick_ramp_label = _tuning_cell(
-        app,
-        row1,
-        f"过渡 {app._config.left_stick.ramp:.1f}/s",
-        app._stick_ramp_var,
-        0.0,
-        12.0,
-        24,
-        app._apply_stick_ramp,
-    )
-    cell.grid(row=0, column=0, sticky="w", padx=(0, T.S3))
     cell, app._deadzone_label = _tuning_cell(
         app,
         row1,
@@ -69,7 +92,7 @@ def build_mouse_tuning(app, parent) -> None:
         40,
         app._apply_deadzone,
     )
-    cell.grid(row=0, column=1, sticky="w", padx=(0, T.S3))
+    cell.grid(row=0, column=0, sticky="w", padx=(0, T.S3))
     cell, app._sens_label = _tuning_cell(
         app,
         row1,
@@ -80,12 +103,10 @@ def build_mouse_tuning(app, parent) -> None:
         58,
         app._apply_sensitivity,
     )
-    cell.grid(row=0, column=2, sticky="w")
-
-    row2 = _grid_row(parent, 3)
+    cell.grid(row=0, column=1, sticky="w", padx=(0, T.S3))
     cell, app._slow_sens_label = _tuning_cell(
         app,
-        row2,
+        row1,
         f"慢灵敏 {app._config.mouse.slow_sensitivity:.2f}",
         app._slow_sens_var,
         0.2,
@@ -93,7 +114,9 @@ def build_mouse_tuning(app, parent) -> None:
         28,
         app._apply_slow_sensitivity,
     )
-    cell.grid(row=0, column=0, sticky="w", padx=(0, T.S3))
+    cell.grid(row=0, column=2, sticky="w")
+
+    row2 = _grid_row(parent, 3)
     cell, app._fast_sens_label = _tuning_cell(
         app,
         row2,
@@ -104,7 +127,7 @@ def build_mouse_tuning(app, parent) -> None:
         55,
         app._apply_fast_sensitivity,
     )
-    cell.grid(row=0, column=1, sticky="w", padx=(0, T.S3))
+    cell.grid(row=0, column=0, sticky="w", padx=(0, T.S3))
     cell, app._smoothing_label = _tuning_cell(
         app,
         row2,
@@ -115,7 +138,7 @@ def build_mouse_tuning(app, parent) -> None:
         60,
         app._apply_smoothing,
     )
-    cell.grid(row=0, column=2, sticky="w")
+    cell.grid(row=0, column=1, sticky="w")
 
     extras = ctk.CTkFrame(parent, fg_color="transparent")
     extras.pack(fill="x")

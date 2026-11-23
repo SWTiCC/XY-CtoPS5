@@ -1,7 +1,7 @@
 """运行页：捕获状态、手感调参、捕获目标。
 
 布局目标是一屏放得下（默认窗口 940×760）：整页排成一张卡，按
-「状态 / 鼠标 / 扳机 / 捕获目标」分四段，滑条走三列网格，
+「状态 / 左摇杆 / 鼠标 / 扳机 / 捕获目标」分段，滑条走三列网格，
 避免旧版那样横向被窗口裁掉、纵向把日志区挤没。
 
 只负责"长什么样"；回调都在 app.py，尺寸与颜色来自 theme.py。
@@ -79,6 +79,8 @@ def _build_status(app, parent) -> None:
         text_color=T.TEXT_DIM,
     )
     app._stick_value_label.pack(side="left")
+    # 过渡速度也是左摇杆的设置，挨着幅度放在同一行
+    run_tuning_ui.build_left_stick(app, controls)
 
     info = ctk.CTkFrame(parent, fg_color="transparent")
     info.pack(fill="x", pady=(T.S1, 0))

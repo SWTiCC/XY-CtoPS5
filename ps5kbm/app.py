@@ -1111,7 +1111,7 @@ class Ps5KbmApp:
         """左摇杆过渡速度：越大推得越快，0 表示瞬时到位。"""
         ramp = float(value)
         self._config.left_stick.ramp = ramp
-        self._stick_ramp_label.configure(text=f"过渡 {ramp:.1f}/s")
+        self._stick_ramp_label.configure(text=f"{ramp:.1f}/s")
 
     def _apply_deadzone(self, value: float) -> None:
         """右摇杆死区：越小越灵敏，0 表示完全不过滤微小位移。"""
