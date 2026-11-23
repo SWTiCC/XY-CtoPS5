@@ -36,14 +36,14 @@ const S = {
   connect2: { from: 1812, duration: 636 },
   mapping1: { from: 2448, duration: 459 },
   mapping2: { from: 2907, duration: 615 },
-  run1: { from: 3522, duration: 435 },
-  run2: { from: 3957, duration: 450 },
-  run3: { from: 4407, duration: 471 },
-  run4: { from: 4878, duration: 336 },
-  outro: { from: 5214, duration: 234 },
+  run1: { from: 3522, duration: 500 },
+  run2: { from: 4022, duration: 450 },
+  run3: { from: 4472, duration: 370 },
+  run4: { from: 4842, duration: 336 },
+  outro: { from: 5178, duration: 234 },
 } as const;
 
-export const PS5_TOTAL = 5448;
+export const PS5_TOTAL = 5412;
 
 // ---------------------------------------------------------------------------
 // 高级背景：径向辉光 + 透视网格 + 扫描线 + 暗角
@@ -845,8 +845,8 @@ const SHOTS: { key: keyof typeof S; comp: React.ReactNode }[] = [
         title="运行 · 开始捕获"
         voice="voice/10_run.mp3"
         callouts={[
-          { x: 0.286, y: 0.251, w: 0.168, h: 0.042, label: '开始捕获', delay: 40 },
-          { x: 0.28, y: 0.32, w: 0.68, h: 0.025, label: '输入 / 摇杆实时数值', delay: 110 },
+          { x: 0.28, y: 0.73, w: 0.68, h: 0.035, label: '① 先选捕获时切到的窗口', delay: 40 },
+          { x: 0.286, y: 0.286, w: 0.168, h: 0.042, label: '② 再点开始捕获', delay: 150 },
         ]}
         zoomFrom={0.97}
         zoomTo={1.03}
@@ -877,8 +877,7 @@ const SHOTS: { key: keyof typeof S; comp: React.ReactNode }[] = [
         title="运行 · 扳机与窗口"
         voice="voice/12_run3.mp3"
         callouts={[
-          { x: 0.28, y: 0.575, w: 0.68, h: 0.12, label: 'R2 / L2 深度 · 加深减浅键', delay: 40 },
-          { x: 0.28, y: 0.71, w: 0.68, h: 0.035, label: '捕获时切到的窗口', delay: 150 },
+          { x: 0.28, y: 0.61, w: 0.68, h: 0.12, label: 'R2 / L2 深度 · 加深减浅键', delay: 40 },
         ]}
         zoomFrom={0.98}
         zoomTo={1.04}
@@ -908,7 +907,7 @@ const Bgm: React.FC = () => (
     volume={(f) =>
       interpolate(
         f,
-        [0, 20, 5200, 5448],
+        [0, 20, 5180, 5412],
         [0, 0.16, 0.16, 0],
         { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' },
       )
@@ -927,11 +926,11 @@ const SFX_DEFS = [
   { from: 2440, src: 'whoosh-fast.mp3', volume: 0.42 },
   { from: 2899, src: 'transition-snap.mp3', volume: 0.4 },
   { from: 3514, src: 'whoosh-big.mp3', volume: 0.4 },
-  { from: 3949, src: 'transition-soft.mp3', volume: 0.35 },
-  { from: 4399, src: 'whoosh-fast.mp3', volume: 0.4 },
-  { from: 4870, src: 'transition-soft.mp3', volume: 0.35 },
-  { from: 5194, src: 'riser-cine.mp3', volume: 0.5 },
-  { from: 5274, src: 'impact-cine.mp3', volume: 0.55 },
+  { from: 4014, src: 'transition-soft.mp3', volume: 0.35 },
+  { from: 4464, src: 'whoosh-fast.mp3', volume: 0.4 },
+  { from: 4834, src: 'transition-soft.mp3', volume: 0.35 },
+  { from: 5158, src: 'riser-cine.mp3', volume: 0.5 },
+  { from: 5238, src: 'impact-cine.mp3', volume: 0.55 },
 ];
 
 const SfxTrack: React.FC = () => (
