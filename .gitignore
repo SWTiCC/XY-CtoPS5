@@ -33,3 +33,8 @@ app/stdout.log
 
 # PyInstaller 其他构建产物
 build-*/
+
+# 视频工程
+video/node_modules/
+video/out/
+video/.cache/
