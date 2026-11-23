@@ -46,6 +46,8 @@ PS5 主机**不直接支持键盘鼠标**。本工具在 PC 上建立一条 Remo
 
 ### 其他
 
+- **已配对主机一键连接**：记住上次配对的主机，启动时自动检测它是否在当前局域网；
+  在线就停在快捷页点「直接连接」，不在线自动回到完整连接流程
 - **透明置顶覆盖层**：捕获时抢焦点、隐藏鼠标指针、右上角短暂显示模式名 / 扳机深度
 - **扳机深度**：L2 / R2 可设定按压深度（走 Remote Play 的 analog button 事件），滚轮 / 键盘 / 滑条都能调
 - **目标窗口**：开始捕获时自动把焦点切到指定窗口
@@ -94,9 +96,11 @@ PS5 上：**设置 → 系统 → 远程游玩 → 启用远程游玩**
 
 ### 5. 连接并开始捕获
 
-1. 打开 XY-CtoPS5 → 「运行」页 → 点 **连接主机**
-2. 点 **开始捕获**（或按 **F8**）
-3. 切到采集卡窗口，用键鼠控制 PS5
+1. 打开 XY-CtoPS5 → 「连接」页
+2. **第一次用**：按上面第 4 步完成配对，然后点 **连接主机**
+3. **之后每次**：启动程序会自动检测已配对的主机，在线时点 **直接连接** 即可，不用再填任何东西；
+   要换主机或换 PSN 账号，点 **换 ID 连接** 回到完整流程
+4. 点 **开始捕获**（或按 **F8**），切到采集卡窗口，用键鼠控制 PS5
 
 ---
 
@@ -145,8 +149,10 @@ Remote Play 配对需要你的 **PSN 账号 ID**（64 位数字，通常以 Base
 
 ### 第 4 步：连接与捕获
 
-1. 「运行」页 → **连接主机**
-2. 状态变成"已连接"后 → **开始捕获**（或 F8）
+1. 「连接」页 → **连接主机**（已配对过时是 **直接连接**）
+   - 程序启动时会自动检测已配对主机在不在当前局域网；
+   - 在线：快捷页点「直接连接」；不在线：自动回到完整流程，按提示重试或重新配对
+2. 状态变成"已连接"后 → 「运行」页 → **开始捕获**（或 F8）
 3. 切到采集卡预览窗口，用键鼠操作 PS5
 
 **注意**：PS5 同一时间只允许**一个** Remote Play 会话。如果提示"主机被占用"，说明 PS5 上还挂着别的会话——在 PS5 上关掉再打开「启用远程游玩」，或重启主机。
@@ -256,8 +262,9 @@ PS5 同一时间只允许一个 Remote Play 会话。在 PS5 上：设置 → �
   ├─ 摇杆状态包 60Hz 发送（含 16 位序列号回绕补丁）
   └─ 按钮事件 / 扳机模拟量事件（analog button 0x86/0x87）
 
-界面层 (app.py + ui_pages.py + ui_common.py)
-  ├─ 连接 / 映射 / 运行三页（customtkinter）
+界面层 (app.py + ui_pages.py + connect_ui.py + ui_common.py)
+  ├─ 连接页：快捷连接 / 完整配对流程 + 已配对主机局域网检测
+  ├─ 映射 / 运行两页（customtkinter）
   └─ 透明覆盖层（抢焦点、隐藏光标、提示）
 ```
 
@@ -332,6 +339,8 @@ Video comes from an HDMI capture card (near-zero latency), input goes through th
 - **Response curves** — linear / quadratic / cubic / power
 - **Multi-mode key mapping** — each mode has its own full mapping set, cycled by a hotkey
 - **Trigger depth** — L2/R2 can output partial press depth via analog button events
+- **One-click reconnect** — the paired console is remembered; on launch the app checks the LAN
+  and offers a single "Connect" button (or "Switch account" to re-pair)
 - **Transparent overlay** — grabs focus, hides the cursor, shows mode/trigger notices
 - **Tuning saved separately** — feel parameters live in `tuning.json` and survive preset changes
 
@@ -349,7 +358,8 @@ Video comes from an HDMI capture card (near-zero latency), input goes through th
 3. **Get your PSN Account ID** — a 64-bit ID, usually written as Base64 (e.g. `57e082umn2c=`). Community PSN lookup tools can resolve your online ID to it; other Remote Play tools also store it.
 4. **Get the PIN** — on PS5: Remote Play → **Add Device**, an 8-digit PIN appears on screen
 5. **Pair** — in the app: PS5 IP + Account ID + PIN
-6. **Connect & capture** — Run page → Connect → Start Capture (or press F8)
+6. **Connect & capture** — Connect page: first run uses the full form (IP + Account ID + PIN);
+   later launches auto-detect the paired console — just click **Connect** (or **Switch account** to re-pair) → Run page → Start Capture (or press F8)
 7. **Tune** — sliders for deadzone / sensitivity / two-segment / smoothing / triggers; all applied live and saved on release
 
 ## Build

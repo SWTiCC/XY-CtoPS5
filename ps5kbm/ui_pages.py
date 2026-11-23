@@ -27,9 +27,7 @@ from .ui_common import describe_action, format_stick_keys
 from .ui_widgets import (
     build_card,
     build_status_pill,
-    field,
     font,
-    ghost_button,
     primary_button,
     secondary_button,
 )
@@ -93,57 +91,6 @@ def set_nav_state(app, active: str) -> None:
             button.configure(fg_color=T.ACCENT_SOFT, text_color=T.TEXT)
         else:
             button.configure(fg_color="transparent", text_color=T.TEXT_DIM)
-
-
-# ---------------------------------------------------------------- 连接页
-def build_connect_page(app, parent) -> ctk.CTkFrame:
-    page = ctk.CTkFrame(parent, fg_color=T.BG, corner_radius=0)
-
-    host_card = build_card(page, "主机", "扫描局域网，或直接填 PS5 的 IP")
-    host_card.pack(fill="x", pady=(0, T.S3))
-    row = ctk.CTkFrame(host_card, fg_color="transparent")
-    row.pack(fill="x", padx=T.S4, pady=T.S3)
-    app._host_entry = field(row, "PS5 IP", width=180, textvariable=app._host_var)
-    scan = secondary_button(row, "扫描局域网", app._scan_devices, width=110)
-    scan.pack(side="left", pady=(T.S4, 0))
-
-    app._device_list = ctk.CTkScrollableFrame(
-        host_card, fg_color=T.SURFACE_HOVER, corner_radius=T.R_SM, height=96
-    )
-    app._device_list.pack(fill="x", padx=T.S4, pady=(0, T.S4))
-    ctk.CTkLabel(
-        app._device_list,
-        text="还没有扫描结果",
-        font=font(T.XS),
-        text_color=T.TEXT_FAINT,
-    ).pack(anchor="w", padx=T.S2, pady=T.S2)
-
-    pair_card = build_card(page, "配对", "首次使用才需要；凭据会保存在 credentials.json")
-    pair_card.pack(fill="x", pady=(0, T.S3))
-    pair_row = ctk.CTkFrame(pair_card, fg_color="transparent")
-    pair_row.pack(fill="x", padx=T.S4, pady=T.S3)
-    account = field(pair_row, "PSN Account ID", width=220, textvariable=app._account_var)
-    pin = field(pair_row, "8 位 PIN", width=110, textvariable=app._pin_var)
-    secondary_button(pair_row, "配对", app._pair_console, width=80).pack(
-        side="left", pady=(T.S4, 0)
-    )
-    ctk.CTkLabel(
-        pair_card,
-        text="Account ID 用 run.cmd login 获取\nPIN 在 PS5：设置 → 系统 → 远程游玩 → 关联设备",
-        font=font(T.XS),
-        text_color=T.TEXT_FAINT,
-        justify="left",
-        anchor="w",
-    ).pack(fill="x", padx=T.S4, pady=(0, T.S4))
-
-    action_row = ctk.CTkFrame(page, fg_color="transparent")
-    action_row.pack(fill="x", pady=(T.S2, 0))
-    app._connect_button = primary_button(action_row, "连接主机", app._connect, width=180)
-    app._connect_button.pack(side="left")
-    app._disconnect_button = secondary_button(action_row, "断开", app._disconnect, width=96)
-    app._disconnect_button.pack(side="left", padx=T.S2)
-    app._disconnect_button.configure(state="disabled")
-    return page
 
 
 # ---------------------------------------------------------------- 映射页

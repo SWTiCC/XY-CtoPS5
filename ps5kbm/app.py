@@ -21,7 +21,8 @@ from tkinter import messagebox
 
 import customtkinter as ctk
 
-from . import bridge, config, ui_pages, windows
+from . import bridge, config, connect_ui, probe, ui_pages, windows
+from . import connect_flow as flow
 from . import theme as T
 from .input_source import InputSource
 from .mapping import InputMapper
@@ -47,6 +48,15 @@ class Ps5KbmApp:
         self._log_queue: queue.Queue = queue.Queue()
         self._ui_queue: queue.Queue = queue.Queue()
         self._setup_logging()
+        # 连接页状态（先声明，_state_vars 会按凭据填 _paired）
+        self._paired: flow.PairedConsole | None = None
+        self._probe_state = flow.STATE_UNPAIRED
+        self._probe_pending = False
+        self._probe_error = ""
+        self._connect_error = ""
+        self._connecting = False
+        # 用户是否主动切到完整流程（点过「换 ID 连接」）；是的话检测结果不再把人拽回去
+        self._manual_full = False
         self._state_vars()
 
         self._loop = asyncio.new_event_loop()
@@ -82,21 +92,33 @@ class Ps5KbmApp:
     # ------------------------------------------------------------ 初始化
     def _state_vars(self) -> None:
         cfg = self._reload_config()
-        # 已配对过的话，直接从 credentials.json 带回 IP 与 Account ID，省得重新翻
-        host = cfg.ps5_host
-        account_id = cfg.account_id
-        if not host or not account_id:
-            try:
-                credentials = config.load_credentials(cfg.credentials_path)
-                host = host or credentials.get("device_ip", "")
-                account_id = account_id or credentials.get("account_id_input", "")
-            except (OSError, ValueError):
-                pass
+        # 已配对过的话，凭据里的地址与账号更权威（可能被探测更新过 IP）
+        self._paired = self._read_paired()
+        host = (self._paired.host_ip if self._paired else "") or cfg.ps5_host
+        account_id = (self._paired.account_id if self._paired else "") or cfg.account_id
         self._host_var = tk.StringVar(value=host or "192.168.1.38")
         self._account_var = tk.StringVar(value=account_id)
         self._pin_var = tk.StringVar()
         self._preset_var = tk.StringVar(value=cfg.preset)
         self._preset_values = config.list_presets()
+
+    def _read_paired(self) -> flow.PairedConsole | None:
+        """从 credentials.json 提炼「已配对主机」；文件缺失或损坏都当作没配对。"""
+        path = self._config.credentials_path
+        if not os.path.exists(path):
+            return None
+        try:
+            raw = config.load_credentials(path)
+        except (OSError, ValueError) as exc:
+            logging.getLogger(__name__).warning("读取配对凭据失败：%s", exc)
+            return None
+        return flow.summarize_credentials(raw)
+
+    def _refresh_paired(self) -> None:
+        """配对 / 连接成功后重新读凭据，刷新快捷视图显示的主机身份。"""
+        paired = self._read_paired()
+        if paired is not None:
+            self._paired = paired
 
     def _setup_logging(self) -> None:
         root_logger = logging.getLogger()
@@ -257,7 +279,7 @@ class Ps5KbmApp:
         content = ctk.CTkFrame(body, fg_color=T.BG, corner_radius=0)
         content.pack(side="left", fill="both", expand=True, padx=(T.S4, 0))
         self._pages = {
-            "connect": ui_pages.build_connect_page(self, content),
+            "connect": connect_ui.build_connect_page(self, content),
             "mapping": ui_pages.build_mapping_page(self, content),
             "run": ui_pages.build_run_page(self, content),
         }
@@ -267,6 +289,15 @@ class Ps5KbmApp:
         ui_pages.build_log_panel(self, self.root)
         ui_pages.refresh_mapping_list(self)
         self.show_page("connect")
+        # 已配对 → 先进快捷视图并立刻检测局域网；没配对 → 保持完整流程
+        self._probe_state = (
+            flow.STATE_CHECKING if self._paired is not None else flow.STATE_UNPAIRED
+        )
+        connect_ui.show_view(self, flow.initial_view(self._paired))
+        connect_ui.render(self)
+        if self._paired is not None:
+            # 等界面画完再发探测，避免首帧卡在加载状态
+            self.root.after(120, self._start_probe)
 
     def show_page(self, name: str) -> None:
         for page in self._pages.values():
@@ -318,16 +349,6 @@ class Ps5KbmApp:
                 self._set_pill("未连接", T.TEXT_FAINT)
                 self._set_run_state("未连接主机", "先到「连接」页建立会话，再回到这里开始捕获")
 
-    def _apply_disconnected(self) -> None:
-        self._bridge = None
-        self._connect_button.configure(state="normal")
-        self._disconnect_button.configure(state="disabled")
-        self._capture_button.configure(state="disabled")
-        self._source.release_cursor()
-        self._apply_capture_state(False)
-        self._set_pill("未连接", T.TEXT_FAINT)
-        self._set_run_state("会话已断开", "点「连接主机」重新连接")
-
     def _apply_key_state(self, name: str) -> None:
         listening = "监听正常" if self._source.listening else "监听异常"
         self._input_state_label.configure(
@@ -347,7 +368,125 @@ class Ps5KbmApp:
             )
         )
 
-    # ------------------------------------------------------------ 连接流程
+    # ------------------------------------------------------------ 已配对主机（快捷连接）
+    def _start_probe(self) -> None:
+        """检测已配对主机是否在当前局域网。
+
+        只读主机身份，不建立 Remote Play 会话，因此不会占用 PS5 那条唯一的会话。
+        探测任务跑在后台 asyncio 线程，结果经 _ui_queue 回主线程渲染。
+        """
+        if self._paired is None:
+            self._probe_state = flow.STATE_UNPAIRED
+            connect_ui.render(self)
+            return
+        if self._probe_pending or self._connecting or self._bridge is not None:
+            return
+        try:
+            credentials = config.load_credentials(self._config.credentials_path)
+        except (OSError, ValueError) as exc:
+            self._append_log(f"读取配对凭据失败：{exc}")
+            self._paired = None
+            self._probe_state = flow.STATE_UNPAIRED
+            connect_ui.render(self)
+            return
+        self._probe_pending = True
+        self._probe_state = flow.STATE_CHECKING
+        self._probe_error = ""
+        self._connect_error = ""
+        connect_ui.render(self)
+        self._append_log(f"正在检测局域网里的已配对主机：{self._paired.display_name}……")
+        future = asyncio.run_coroutine_threadsafe(
+            probe.probe_console(credentials), self._loop
+        )
+        future.add_done_callback(self._on_probe_finished)
+
+    def _on_probe_finished(self, future) -> None:
+        """探测结束（在 asyncio 线程执行）：把结果丢进队列，绝不在这里碰 Tk。"""
+        if not future.cancelled():
+            try:
+                result = future.result()
+            except Exception as exc:  # noqa: BLE001 - probe 内部已兜底，这里只防万一
+                result = probe.ProbeResult(
+                    online=False, error=f"{type(exc).__name__}: {exc}"
+                )
+            self._ui_queue.put(("probe", result))
+
+    def _apply_probe_result(self, result) -> None:
+        self._probe_pending = False
+        self._probe_error = result.error
+        if result.online:
+            self._probe_state = flow.STATE_ONLINE
+            self._apply_probe_identity(result)
+            self._append_log(
+                f"已配对主机在线：{result.host_name or result.host_ip}（{result.host_ip}）"
+            )
+            # 用户主动切到完整流程时不打扰；否则回到一键连接
+            if self._bridge is None and not self._manual_full:
+                connect_ui.show_view(self, flow.VIEW_QUICK)
+        else:
+            self._probe_state = flow.STATE_ERROR if result.error else flow.STATE_OFFLINE
+            self._manual_full = False
+            name = self._paired.display_name if self._paired else "已配对主机"
+            if result.error:
+                self._append_log(f"检测已配对主机失败：{result.error}")
+            else:
+                self._append_log(f"没有在当前局域网发现已配对主机：{name}")
+            connect_ui.show_view(self, flow.VIEW_FULL)
+        connect_ui.render(self)
+
+    def _apply_probe_identity(self, result) -> None:
+        """用探测结果刷新主机身份；PS5 换了 IP 时把新地址写回凭据。"""
+        paired = self._paired
+        if paired is None:
+            return
+        host_ip = result.host_ip or paired.host_ip
+        ip_changed = bool(host_ip) and host_ip != paired.host_ip
+        self._paired = flow.PairedConsole(
+            host_id=result.host_id or paired.host_id,
+            host_name=result.host_name or paired.host_name,
+            host_ip=host_ip,
+            account_id=paired.account_id,
+            device_type=result.device_type or paired.device_type,
+        )
+        if not ip_changed or not result.credentials:
+            return
+        try:
+            config.save_credentials(self._config.credentials_path, result.credentials)
+        except OSError as exc:
+            self._append_log(f"保存新 IP 失败：{exc}")
+            return
+        self._config.ps5_host = host_ip
+        self._host_var.set(host_ip)
+        self._persist()
+        self._append_log(f"主机 IP 已更新为 {host_ip}")
+
+    def _quick_connect(self) -> None:
+        """快捷视图的「直接连接」：用已保存凭据建立会话，不再要求任何输入。"""
+        if self._bridge is not None or self._connecting:
+            return
+        self._manual_full = False
+        self._connect()
+
+    def _switch_account(self) -> None:
+        """「换 ID 连接」：回到完整流程，可改 Account ID 或配对新主机。"""
+        self._manual_full = True
+        connect_ui.show_view(self, flow.VIEW_FULL)
+        connect_ui.render(self)
+        self._append_log("已切到完整连接流程：可改 Account ID，或扫描后配对新主机")
+        try:
+            self._account_entry.focus_set()
+        except Exception:  # noqa: BLE001 - 焦点设置失败不影响流程
+            pass
+
+    def _use_quick_view(self) -> None:
+        """从完整流程回到已配对主机的快捷视图。"""
+        if self._paired is None:
+            return
+        self._manual_full = False
+        connect_ui.show_view(self, flow.VIEW_QUICK)
+        connect_ui.render(self)
+
+    # ------------------------------------------------------------ 完整流程（扫描 / 配对 / 连接）
     def _scan_devices(self) -> None:
         self._append_log("开始扫描局域网……")
         future = asyncio.run_coroutine_threadsafe(bridge.discover(timeout=3.0), self._loop)
@@ -405,13 +544,31 @@ class Ps5KbmApp:
     def _on_pair_done(self, future) -> None:
         try:
             credentials = future.result()
-            self._append_log(f"配对成功：{credentials.get('host_name') or credentials['device_ip']}")
         except Exception as exc:  # noqa: BLE001
             self._append_log(f"配对失败：{exc}")
+            return
+        self._append_log(
+            f"配对成功：{credentials.get('host_name') or credentials['device_ip']}"
+        )
+        self._refresh_paired()
+        if self._paired is None:
+            return
+        # 刚配对成功说明主机就在线，直接进快捷视图，不用再等一轮检测
+        self._probe_state = flow.STATE_ONLINE
+        self._probe_error = ""
+        self._connect_error = ""
+        self._manual_full = False
+        self._host_var.set(self._paired.host_ip)
+        self._account_var.set(self._paired.account_id)
+        connect_ui.show_view(self, flow.VIEW_QUICK)
+        connect_ui.render(self)
 
     def _connect(self) -> None:
-        if self._bridge is not None:
+        if self._bridge is not None or self._connecting:
             return
+        self._connecting = True
+        self._connect_error = ""
+        connect_ui.render(self)
         self._append_log("正在建立 Remote Play 会话……")
         future = asyncio.run_coroutine_threadsafe(self._connect_async(), self._loop)
         future.add_done_callback(lambda fut: self.root.after(0, self._on_connected, fut))
@@ -428,10 +585,12 @@ class Ps5KbmApp:
         return ps5
 
     def _on_connected(self, future) -> None:
+        self._connecting = False
         try:
             self._bridge = future.result()
         except Exception as exc:  # noqa: BLE001
             detail = str(exc)
+            self._connect_error = detail
             self._append_log(f"连接失败：{detail}")
             # 之前只写日志，用户点了按钮看不到任何反馈；这里显式弹窗
             if "Another Remote Play session" in detail:
@@ -443,12 +602,16 @@ class Ps5KbmApp:
                 )
             else:
                 messagebox.showerror("连接失败", detail)
+            connect_ui.render(self)
             return
+        self._probe_state = flow.STATE_ONLINE
+        self._probe_error = ""
+        self._refresh_paired()
         self._set_pill(f"已连接 · {self._bridge.host}", T.OK)
         self._set_run_state("已连接", "点「开始捕获」把键鼠交给 PS5")
-        self._connect_button.configure(state="disabled")
-        self._disconnect_button.configure(state="normal")
         self._capture_button.configure(state="normal")
+        connect_ui.show_view(self, flow.VIEW_QUICK)
+        connect_ui.render(self)
         if not self._source_ready:
             self._source.start()
             self._source_ready = True
@@ -460,6 +623,8 @@ class Ps5KbmApp:
         ps5 = self._bridge
         self._running = False
         self._bridge = None
+        self._connecting = False
+        self._connect_error = ""
         self._stop_tick_loop()
         if self._source.capturing:
             self._source.toggle_capture()
@@ -470,10 +635,13 @@ class Ps5KbmApp:
                 future.result(timeout=8)
             except Exception as exc:  # noqa: BLE001 - 关闭失败不影响本地状态
                 self._append_log(f"关闭会话时出错：{exc}")
-        self._connect_button.configure(state="normal")
-        self._disconnect_button.configure(state="disabled")
-        self._capture_button.configure(state="disabled")
         self._apply_capture_state(False)
+        self._set_run_state("会话已断开", "回「连接」页重新连接")
+        self._capture_button.configure(state="disabled")
+        # 断开后回到该回的位置：配对过就回一键连接，否则留在完整流程
+        self._manual_full = False
+        connect_ui.show_view(self, flow.initial_view(self._paired))
+        connect_ui.render(self)
         self._append_log("已断开")
 
     # ------------------------------------------------------------ 运行循环
@@ -886,8 +1054,8 @@ class Ps5KbmApp:
                 kind, value = self._ui_queue.get_nowait()
                 if kind == "capture":
                     self._apply_capture_state(value)
-                elif kind == "disconnected":
-                    self._apply_disconnected()
+                elif kind == "probe":
+                    self._apply_probe_result(value)
                 elif kind == "stick":
                     self._apply_stick_value(value)
                 elif kind == "sticks":

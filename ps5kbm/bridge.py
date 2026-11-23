@@ -12,19 +12,14 @@
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import time
 from typing import Iterable
 
+from ._deps import ensure_vendor_path
+
 # 源码运行时，项目内的 netifaces 兼容层必须先于 pyremoteplay 进入 sys.path；
 # 打包成 exe 后 netifaces 已作为模块内置，不需要也不该改 sys.path。
-if not getattr(sys, "frozen", False):
-    _VENDOR = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "vendor"
-    )
-    if os.path.isdir(_VENDOR) and _VENDOR not in sys.path:
-        sys.path.insert(0, _VENDOR)
+ensure_vendor_path()
 
 from playdirector import ConsoleController, ConsoleError, pair_console, scan  # noqa: E402
 from pyremoteplay.stream_packets import ControllerState  # noqa: E402

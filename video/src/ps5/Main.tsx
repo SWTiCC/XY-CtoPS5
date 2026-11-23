@@ -144,7 +144,7 @@ const SceneIntro: React.FC = () => {
           采集卡画面 · Remote Play 输入通道
         </div>
       </div>
-      <Audio src={staticFile('voice/01_intro.wav')} />
+      <Audio src={staticFile('voice/01_intro.mp3')} />
     </AbsoluteFill>
   );
 };
@@ -249,7 +249,7 @@ const SceneDiagram: React.FC = () => {
       <DiagramBox x={1350} y={520} label="键鼠" sub="伪装成手柄" delay={66} color={ACCENT} />
       <Arrow x1={1070} x2={1330} y={615} delay={76} color={ACCENT} label="手柄协议" />
       <Cap text="画面：采集卡 / 输入：Remote Play" from={20} />
-      <Audio src={staticFile('voice/02_diagram.wav')} />
+      <Audio src={staticFile('voice/02_diagram.mp3')} />
     </AbsoluteFill>
   );
 };
@@ -312,7 +312,7 @@ const SceneMouse: React.FC = () => {
         <Bullet index={3} title="Flick Stick" desc="快速甩动瞬间转身" />
       </div>
       <Cap text="照着业界成熟方案实现" from={16} />
-      <Audio src={staticFile('voice/03_mouse.wav')} />
+      <Audio src={staticFile('voice/03_mouse.mp3')} />
     </AbsoluteFill>
   );
 };
@@ -356,7 +356,7 @@ const SceneFeatures: React.FC = () => {
       <Feat x={180} y={260} icon="🎮" title="多套按键映射" desc="每个模式一套键位，一个键循环切换" delay={8} />
       <Feat x={760} y={260} icon="🎚️" title="扳机深度可调" desc="L2 / R2 按设定深度输出" delay={22} />
       <Feat x={1340} y={260} icon="⚡" title="参数实时生效" desc="滑条即调即用，松手保存" delay={36} />
-      <Audio src={staticFile('voice/04_features.wav')} />
+      <Audio src={staticFile('voice/04_features.mp3')} />
     </AbsoluteFill>
   );
 };
@@ -404,7 +404,7 @@ const SceneOutro: React.FC = () => {
           采集卡 + Remote Play 输入通道 · 仅建议单人单机游戏
         </div>
       </div>
-      <Audio src={staticFile('voice/05_outro.wav')} />
+      <Audio src={staticFile('voice/05_outro.mp3')} />
     </AbsoluteFill>
   );
 };
@@ -430,8 +430,46 @@ const SHOT_COMPONENTS: { key: keyof typeof PS5_SHOTS; comp: React.ReactNode }[] 
   { key: 'outro', comp: <SceneOutro /> },
 ];
 
+// 背景音乐：首尾淡入淡出，旁白段压低（0.22 → 0.12）
+const Bgm: React.FC = () => (
+  <Audio
+    src={staticFile('audio/bgm-tech-house.mp3')}
+    volume={(f) =>
+      interpolate(
+        f,
+        [0, 20, 300, 460, 470, 760, 770, 1030, 1040, 1330, 1350],
+        [0, 0.22, 0.22, 0.12, 0.12, 0.22, 0.22, 0.12, 0.12, 0.22, 0],
+        { extrapolateLeft: 'clamp', extrapolateRight: 'clamp' },
+      )
+    }
+  />
+);
+
+// 音效钉帧：落定 impact、转场 whoosh、结尾 sparkle
+const SFX_DEFS = [
+  { from: 24, src: 'impact-cine.mp3', volume: 0.5 }, // 开场字标落定
+  { from: 30, src: 'sparkle.mp3', volume: 0.35 }, // 扫光
+  { from: 172, src: 'whoosh-fast.mp3', volume: 0.45 }, // → 原理图
+  { from: 472, src: 'transition-snap.mp3', volume: 0.45 }, // → 鼠标
+  { from: 772, src: 'whoosh-fast.mp3', volume: 0.45 }, // → 功能
+  { from: 1042, src: 'riser-cine.mp3', volume: 0.5 }, // 铺垫结尾
+  { from: 1100, src: 'impact-cine.mp3', volume: 0.55 }, // 结尾字标
+];
+
+const SfxTrack: React.FC = () => (
+  <>
+    {SFX_DEFS.map((item, index) => (
+      <Sequence key={`${item.src}-${index}`} from={item.from} durationInFrames={90}>
+        <Audio src={staticFile(`audio/${item.src}`)} volume={item.volume} />
+      </Sequence>
+    ))}
+  </>
+);
+
 export const Ps5Main: React.FC = () => (
   <AbsoluteFill style={{ background: BG }}>
+    <Bgm />
+    <SfxTrack />
     {SHOT_COMPONENTS.map(({ key, comp }) => {
       const shot = PS5_SHOTS[key];
       return (
