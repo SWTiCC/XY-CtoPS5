@@ -27,6 +27,11 @@ from . import (
     bridge,
     config,
     connect_ui,
+    controller_ui,
+    dualsense,
+    gyro,
+    gyro_calib_ui,
+    haptics_usb,
     mapping_ui,
     probe,
     run_tuning_ui,
@@ -96,12 +101,49 @@ class Ps5KbmApp:
         self._last_trace = 0.0
         self._overlay = CaptureOverlay(self.root, self._toggle_capture)
 
+        # 手柄（DualSense）：后台线程读，界面/主循环只拿快照
+        self._controller = dualsense.DualSenseReader()
+        self._usb_haptics = haptics_usb.UsbHaptics()
+        self._gyro_axis = gyro.GyroAxis()
+        self._gyro_bias = tuple(self._config.controller.gyro.bias)
+        self._gyro_output = (0.0, 0.0)
+        self._gyro_calibrated = any(abs(value) > 1e-6 for value in self._gyro_bias)
+        # 自定义陀螺仪激活键：捕获期间等手柄出现"新按下"的按键
+        self._gyro_capture = False
+        self._gyro_capture_deadline = 0.0
+        self._gyro_prev_buttons: set[str] = set()
+        self._gyro_trace_last = 0.0
+        self._last_ui_sticks = 0.0
+        self._controller_buttons_sent: set[str] = set()
+        self._last_trigger_sent: dict[str, float] = {}
+        self._last_ctrl_sticks = ((0.0, 0.0), (0.0, 0.0))
+        self._last_ctrl_send = 0.0
+        self._controller_was_connected = False
+        self._mode_warned = False
+        self._pending_controller_release = False
+        # 主机下发的反馈：手柄页上的开关控制是否转发
+        self._last_console_rumble = 0.0
+        self._last_trigger_blocks: dict[str, bytes] = {}
+        self._trigger_effect_time: dict[str, float] = {"l": 0.0, "r": 0.0}
+        self._trigger_pressed: dict[str, bool] = {"l2": False, "r2": False}
+        bridge.set_feedback_handlers(
+            self._on_console_rumble,
+            self._on_console_trigger_effect,
+            None,
+        )
+        bridge.set_haptics_pcm_handler(self._on_haptics_pcm)
+        # 手柄页轮询定时器 id（关窗时取消）
+        self._poll_job: str | None = None
+
         self._build_ui()
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         # Raw Input 窗口消息由主线程排空（子线程收不到 WM_INPUT）。
         # 间隔 8ms：消息泵本身约 10ms 一批，再密只是空转 Tk 定时器。
         self.root.after(8, self._pump_raw_messages)
+        # 手柄后台读取 + 页面状态轮询
+        self._controller.start_reader()
+        self._poll_job = self.root.after(120, self._poll_controller)
 
     def _pump_raw_messages(self) -> None:
         """主线程定时排空 Raw Input 窗口消息（非阻塞）。"""
@@ -360,6 +402,7 @@ class Ps5KbmApp:
         content.pack(side="left", fill="both", expand=True, padx=(T.S4, 0))
         self._pages = {
             "connect": connect_ui.build_connect_page(self, content),
+            "controller": controller_ui.build_controller_page(self, content),
             "mapping": mapping_ui.build_mapping_page(self, content),
             "run": run_ui.build_run_page(self, content),
         }
@@ -378,6 +421,8 @@ class Ps5KbmApp:
         if self._paired is not None:
             # 等界面画完再发探测，避免首帧卡在加载状态
             self.root.after(120, self._start_probe)
+        # 未连接时只显示「连接」页签
+        self._update_nav()
         # 页面是固定布局（不滚动），窗口缩得比默认尺寸小会把下面内容裁掉
         self._lock_min_window_size()
 
@@ -392,7 +437,34 @@ class Ps5KbmApp:
         except tk.TclError:
             pass
 
+    def _visible_pages(self) -> set[str]:
+        """当前该显示哪些页签。
+
+        手柄玩法：手柄页**始终显示**（先接手柄、看电量和设置，再去连 PS5 唤醒）；
+        键鼠玩法：映射 / 运行页要 PS5 连上才有意义。
+        """
+        pages = {"connect"}
+        if self._config.controller.mode == "controller":
+            pages.add("controller")
+        elif self._bridge is not None:
+            pages.update({"mapping", "run"})
+        return pages
+
+    def _update_nav(self) -> None:
+        """按连接状态与玩法刷新侧栏页签；当前页被隐藏时退回「连接」页。"""
+        pages = self._visible_pages()
+        try:
+            ui_pages.set_nav_visible(self, pages)
+        except Exception:  # noqa: BLE001 - 侧栏还没建好时忽略
+            return
+        if self._page_name not in pages:
+            self.show_page("connect")
+
     def show_page(self, name: str) -> None:
+        if name not in self._pages:
+            return
+        if name not in self._visible_pages():
+            name = "connect"
         for page in self._pages.values():
             page.pack_forget()
         self._pages[name].pack(fill="both", expand=True)
@@ -664,6 +736,44 @@ class Ps5KbmApp:
         connect_ui.show_view(self, flow.VIEW_QUICK)
         connect_ui.render(self)
 
+    def _wake_console(self) -> None:
+        """唤醒待机中的 PS5（DDP 唤醒，不需要先建立会话）。"""
+        if self._bridge is not None:
+            self._append_log("已经连上了，不用唤醒")
+            return
+        if not os.path.exists(self._config.credentials_path):
+            self._append_log("还没有配对凭据：先在完整流程里配对一次")
+            return
+        credentials = config.load_credentials(self._config.credentials_path)
+        self._append_log(
+            "正在唤醒 PS5…（待机唤醒通常 20~40 秒，主机启动后再点「直接连接」）"
+        )
+        for button in getattr(self, "_wake_buttons", []):
+            try:
+                button.configure(state="disabled")
+            except Exception:  # noqa: BLE001
+                pass
+        future = asyncio.run_coroutine_threadsafe(bridge.wake(credentials), self._loop)
+        future.add_done_callback(
+            lambda fut: self.root.after(0, self._on_wake_done, fut)
+        )
+
+    def _on_wake_done(self, future) -> None:
+        for button in getattr(self, "_wake_buttons", []):
+            try:
+                button.configure(state="normal")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            future.result()
+        except Exception as exc:  # noqa: BLE001 - 唤醒失败给提示
+            self._append_log(
+                f"唤醒失败：{exc}（确认 PS5 已开启「远程游玩」，待机时保持网络连接）"
+            )
+            return
+        self._append_log("唤醒指令已发送，等主机启动后点「直接连接」")
+        self.root.after(8000, self._start_probe)
+
     def _connect(self) -> None:
         if self._bridge is not None or self._connecting:
             return
@@ -695,7 +805,20 @@ class Ps5KbmApp:
         try:
             self._bridge = future.result()
         except Exception as exc:  # noqa: BLE001
-            detail = str(exc)
+            detail = str(exc).strip()
+            if not detail:
+                # 超时之类异常 str() 是空的，界面上会只显示「连接失败：」，这里补人话
+                if isinstance(exc, TimeoutError):
+                    detail = (
+                        "连接超时：会话能建立但主机没继续握手。常见原因：\n"
+                        "· PS5 停在登录 / 输入密码界面 —— 先在主机上完成登录，"
+                        "并到「设置 → 用户与账户 → 登录设置」打开自动登录；\n"
+                        "· PS5 在待机 / 关机，或没开启「远程游玩」、待机时没保持网络连接；\n"
+                        "· 主机上还有官方 Remote Play 客户端占着会话。\n\n"
+                        "处理完再点「直接连接」；待机唤醒可点「唤醒主机」。"
+                    )
+                else:
+                    detail = f"{type(exc).__name__}（没有更多错误信息）"
             self._connect_error = detail
             self._append_log(f"连接失败：{detail}")
             # 之前只写日志，用户点了按钮看不到任何反馈；这里显式弹窗
@@ -722,6 +845,8 @@ class Ps5KbmApp:
         self._capture_button.configure(state="normal")
         connect_ui.show_view(self, flow.VIEW_QUICK)
         connect_ui.render(self)
+        # 连上了才显示对应的页签（键鼠：映射/运行；手柄：手柄）
+        self._update_nav()
         if not self._source_ready:
             self._source.start()
             self._source_ready = True
@@ -736,6 +861,13 @@ class Ps5KbmApp:
         self._connecting = False
         self._connect_error = ""
         self._stop_tick_loop()
+        # 会话没了，手柄发出去的状态也不用再补发释放包，直接清空本地记录
+        self._pending_controller_release = False
+        self._controller_buttons_sent.clear()
+        self._last_trigger_sent.clear()
+        self._last_trigger_blocks.clear()
+        self._usb_haptics.close()
+        self._gyro_axis.reset()
         if self._source.capturing:
             self._source.toggle_capture()
         if self._source_ready:
@@ -750,6 +882,8 @@ class Ps5KbmApp:
         self._manual_full = False
         connect_ui.show_view(self, flow.initial_view(self._paired))
         connect_ui.render(self)
+        # 断开后只剩「连接」页签
+        self._update_nav()
         self._append_log("已断开")
         if ps5 is not None:
             # 关闭会话本身放到后台：在界面线程等它会把窗口卡住好几秒
@@ -790,15 +924,31 @@ class Ps5KbmApp:
             try:
                 if now - last_heartbeat >= 30.0:
                     last_heartbeat = now
-                    # 心跳不再写文件（长期运行的热路径日志已移除），
-                    # 只在运行页状态栏体现；排查时看 sent_count 即可
+                    # 心跳不在本线程碰 Tk：这里跑在 asyncio 线程，
+                    # 直接 configure 会和界面线程的 Tk 调用抢锁，实测会卡死。
                     sent = self._bridge.sent_count if self._bridge else 0
-                    self._run_subtitle.configure(text=f"已发送 {sent} 帧输入")
+                    self._ui_queue.put(("heartbeat", sent))
                 # 不在循环里检查 connected：pyremoteplay 的 is_running 在心跳
                 # 间隙可能短暂为 False，之前据此退出循环会把输入直接停掉。
                 if self._bridge is None:
                     self._running = False
                     break
+                if not self._bridge.alive:
+                    # 主机端把会话踢了 / 网络断了：交给界面线程收尾，别继续空转发包
+                    self._ui_queue.put(("session_lost", None))
+                    self._running = False
+                    break
+                # 手柄模式：不走键鼠映射，直接转发手柄 + 陀螺仪
+                if self._controller_mode():
+                    started = time.perf_counter()
+                    self._tick_controller(dt, now)
+                    elapsed = time.perf_counter() - started
+                    if elapsed > 0.05:
+                        logging.getLogger("ps5kbm.tick").warning(
+                            "手柄帧耗时 %.0f ms（可能卡顿）", elapsed * 1000
+                        )
+                    was_capturing = False
+                    continue
                 if self._source.capturing:
                     # 只调用 poll：它读位移后会把光标拉回中心。
                     dx, dy = self._source.poll_mouse_delta()
@@ -858,6 +1008,433 @@ class Ps5KbmApp:
 
     def _on_key_event(self, name: str) -> None:
         self._ui_queue.put(("key", name))
+
+    # ------------------------------------------------------------ 手柄页
+    def _controller_mode(self) -> bool:
+        return self._config.controller.mode == "controller"
+
+    def controller_snapshot(self):
+        """手柄页用的当前状态（没连接返回 None）。"""
+        return self._controller.snapshot() if self._controller.connected else None
+
+    def set_input_mode(self, label: str) -> None:
+        """连接前选择玩法：键鼠映射 / 手柄直通。"""
+        mode = controller_ui.MODE_LABELS.get(label, "keyboard")
+        if self._bridge is not None:
+            messagebox.showwarning(
+                "已经连上了", "先断开连接，再切换玩法（键鼠 / 手柄）。"
+            )
+            self._input_mode_var.set(
+                controller_ui.MODE_LABELS_REVERSE.get(
+                    self._config.controller.mode, "键鼠"
+                )
+            )
+            return
+        if mode == self._config.controller.mode:
+            self._input_mode_var.set(label)
+            return
+        self._config.controller.mode = mode
+        self._input_mode_var.set(label)
+        self._persist()
+        self._update_nav()
+        self._append_log(
+            "玩法："
+            + ("手柄（手柄页用于查看 / 设置手柄连接）" if mode == "controller" else "键鼠（连上 PS5 后显示映射 / 运行）")
+        )
+
+    def refresh_controller(self) -> None:
+        """页面上的「重新检测」：让后台线程立刻再试一次。"""
+        self._controller.start_reader()
+        self._append_log("正在重新检测手柄……")
+
+    def _poll_controller(self) -> None:
+        """界面轮询：刷新手柄页状态、处理断连、跑陀螺仪校准采样。"""
+        try:
+            state = self._controller.snapshot()
+            connected = state is not None
+            if connected != self._controller_was_connected:
+                self._controller_was_connected = connected
+                if connected:
+                    self._append_log(
+                        f"手柄已连接：{self._controller.device_label or 'DualSense'}"
+                    )
+                else:
+                    self._append_log("手柄已断开")
+                    if self._controller_mode():
+                        self._pending_controller_release = True
+            if self._controller_mode() and not connected and not self._mode_warned:
+                self._mode_warned = True
+                self._append_log("手柄模式下没有检测到手柄，接上 USB 线后会自动开始")
+            if connected:
+                self._mode_warned = False
+            # 自定义陀螺仪激活键：抓"新按下"的按键，超时自动取消
+            if self._gyro_capture:
+                if state is not None:
+                    new_buttons = set(state.buttons) - self._gyro_prev_buttons
+                    if new_buttons:
+                        self._finish_gyro_capture(sorted(new_buttons)[0])
+                    elif (
+                        self._gyro_capture_deadline
+                        and time.monotonic() >= self._gyro_capture_deadline
+                    ):
+                        self._gyro_capture = False
+                        self._gyro_capture_deadline = 0.0
+                        self._append_log("没等到按键，陀螺仪激活键没改")
+                        controller_ui.refresh_activation(self)
+            if state is not None:
+                self._gyro_prev_buttons = set(state.buttons)
+        except Exception as exc:  # noqa: BLE001 - 界面轮询不能中断 Tk 定时器
+            logging.getLogger(__name__).warning("手柄页刷新失败：%s", exc)
+        finally:
+            try:
+                controller_ui.refresh(self)
+            except Exception:  # noqa: BLE001 - 页面还没建好时忽略
+                pass
+            self._poll_job = self.root.after(100, self._poll_controller)
+
+    # ------------------------------------------------------------ 陀螺仪
+    def _gyro_params(self) -> gyro.GyroParams:
+        cfg = self._config.controller.gyro
+        return gyro.GyroParams(
+            sensitivity_x=cfg.sensitivity_x,
+            sensitivity_y=cfg.sensitivity_y,
+            deadzone=cfg.deadzone,
+            smoothing=cfg.smoothing,
+            invert_x=cfg.invert_x,
+            invert_y=cfg.invert_y,
+        )
+
+    def _gyro_active(self, state) -> bool:
+        cfg = self._config.controller.gyro
+        return gyro.activation_pressed(
+            cfg.activation, state.buttons, state.l2, state.r2
+        )
+
+    def _toggle_gyro(self) -> None:
+        enabled = bool(self._gyro_var.get())
+        self._config.controller.gyro.enabled = enabled
+        self._append_log("陀螺仪：" + ("开启" if enabled else "关闭"))
+        self._persist()
+
+    def set_gyro_activation(self, choice: str) -> None:
+        """激活键：常开 / 预设按键 / 自定义（按手柄上的键来捕获）。"""
+        if choice == controller_ui.CUSTOM_CHOICE:
+            self._gyro_capture = True
+            self._gyro_capture_deadline = time.monotonic() + 6.0
+            state = self._controller.snapshot()
+            self._gyro_prev_buttons = set(state.buttons) if state else set()
+            self._gyro_activation_var.set(controller_ui.CAPTURE_HINT)
+            self._append_log("请按住手柄上想用来触发陀螺仪的按键（6 秒内）")
+            return
+        self._config.controller.gyro.activation = controller_ui.activation_value(choice)
+        self._persist()
+        self._append_log(f"陀螺仪激活键：{choice}")
+
+    def _finish_gyro_capture(self, button: str) -> None:
+        """自定义激活键捕获完成：写回配置并刷新下拉框。"""
+        self._gyro_capture = False
+        self._gyro_capture_deadline = 0.0
+        self._config.controller.gyro.activation = button.strip().lower()
+        self._persist()
+        self._append_log(f"陀螺仪激活键：按住 {controller_ui.button_label(button)}")
+        controller_ui.refresh_activation(self)
+
+    def _apply_gyro_sens_x(self, value: float) -> None:
+        sens = max(0.1, min(3.0, float(value)))
+        self._config.controller.gyro.sensitivity_x = sens
+        self._gyro_sens_x_label.configure(text=f"水平灵敏度 {sens:.2f}")
+
+    def _apply_gyro_sens_y(self, value: float) -> None:
+        sens = max(0.1, min(3.0, float(value)))
+        self._config.controller.gyro.sensitivity_y = sens
+        self._gyro_sens_y_label.configure(text=f"垂直灵敏度 {sens:.2f}")
+
+    def _apply_gyro_deadzone(self, value: float) -> None:
+        deadzone = max(0.0, min(0.1, float(value)))
+        self._config.controller.gyro.deadzone = deadzone
+        self._gyro_deadzone_label.configure(text=f"死区 {deadzone:.3f}")
+
+    def _apply_gyro_smoothing(self, value: float) -> None:
+        smoothing = max(0.0, min(0.9, float(value)))
+        self._config.controller.gyro.smoothing = smoothing
+        self._gyro_smoothing_label.configure(text=f"平滑 {smoothing:.2f}")
+
+    def _toggle_gyro_invert_x(self) -> None:
+        enabled = bool(self._gyro_invert_x_var.get())
+        self._config.controller.gyro.invert_x = enabled
+        self._append_log("陀螺仪水平方向：" + ("反向" if enabled else "正向"))
+
+    def _toggle_gyro_invert_y(self) -> None:
+        enabled = bool(self._gyro_invert_y_var.get())
+        self._config.controller.gyro.invert_y = enabled
+        self._append_log("陀螺仪垂直方向：" + ("反向" if enabled else "正向"))
+
+    def calibrate_gyro(self) -> None:
+        """打开游戏式校准窗口：放稳 → 倒计时 → 采样 → 结果。"""
+        gyro_calib_ui.open_dialog(self)
+
+    def apply_gyro_bias(self, bias: tuple[float, float, float]) -> None:
+        """校准窗口算出的零偏写回配置并保存。"""
+        self._gyro_bias = (float(bias[0]), float(bias[1]), float(bias[2]))
+        self._config.controller.gyro.bias = list(self._gyro_bias)
+        self._gyro_calibrated = True
+        self._gyro_axis.reset()
+        self._persist()
+        self._append_log(
+            "陀螺仪已校准：偏置 "
+            f"({self._gyro_bias[0]:+.4f}, {self._gyro_bias[1]:+.4f}, {self._gyro_bias[2]:+.4f}) rad/s"
+        )
+
+    # ------------------------------------------------------------ 震动 / 扳机
+    def _toggle_rumble(self) -> None:
+        enabled = bool(self._rumble_var.get())
+        self._config.controller.rumble_enabled = enabled
+        self._append_log("震动转发：" + ("开启" if enabled else "关闭"))
+        self._persist()
+
+    def _apply_rumble_gain(self, value: float) -> None:
+        gain = max(0.0, min(2.0, float(value)))
+        self._config.controller.rumble_gain = gain
+        self._rumble_gain_label.configure(text=f"{gain:.2f}")
+
+    def test_rumble(self) -> None:
+        if not self._controller.connected:
+            self._append_log("先接上手柄再试震动")
+            return
+        self._controller.rumble(0.8, 0.8)
+        self.root.after(250, lambda: self._controller.rumble(0.0, 0.0))
+        # USB 下同时给 3/4 声道送一段 60Hz 触觉波形，单独验证原生触觉通道
+        if self._controller.transport == "usb" and self._config.controller.haptics_usb:
+            import numpy as np
+
+            sample_rate = 48000
+            count = int(sample_rate * 0.6)
+            wave = (np.sin(np.linspace(0, 2 * np.pi * 60 * 0.6, count)) * 6000).astype(np.int16)
+            stereo = np.stack([wave, wave], axis=1).tobytes()
+            self._usb_haptics.feed(stereo)
+            self._append_log("试震动：马达 + USB 触觉波形（3/4 声道，应持续约 0.6 秒）")
+            return
+        self._append_log("试震动：马达（USB 连接才会有原生触觉）")
+
+    def _on_rumble(self, low: float, high: float) -> None:
+        """主机下发的震动 → 本地手柄（协议层验证后再接进来）。"""
+        cfg = self._config.controller
+        if not cfg.rumble_enabled:
+            return
+        gain = cfg.rumble_gain
+        self._controller.rumble(low * gain, high * gain)
+
+    # ------------------------------------------------- 主机下发反馈（后台线程）
+    def _on_console_rumble(self, left: float, right: float) -> None:
+        """主机下发的震动值（0~1，跑在协议线程）：转发到本地手柄。"""
+        cfg = self._config.controller
+        if not cfg.rumble_enabled or not self._controller.connected:
+            return
+        now = time.monotonic()
+        if now - self._last_console_rumble < 0.02:
+            return
+        self._last_console_rumble = now
+        gain = cfg.rumble_gain
+        self._controller.rumble(
+            min(1.0, left * gain),
+            min(1.0, right * gain),
+        )
+
+    def _on_haptics_pcm(self, pcm: bytes) -> None:
+        """主机下发的触觉 PCM（跑在解码线程）：只有 USB 连接才写到手柄音频端点。"""
+        if not self._config.controller.haptics_usb:
+            return
+        if self._controller.transport != "usb":
+            return
+        self._usb_haptics.feed(pcm)
+
+    def _toggle_haptics_usb(self) -> None:
+        enabled = bool(self._haptics_var.get())
+        self._config.controller.haptics_usb = enabled
+        self._append_log("USB 震动：" + ("开启" if enabled else "关闭"))
+        self._persist()
+
+    def _on_console_trigger_effect(self, left: bytes, right: bytes) -> None:
+        """主机下发的扳机效果块（各 11 字节，跑在协议线程）：有变化才写手柄。"""
+        cfg = self._config.controller
+        if not cfg.adaptive_triggers or not self._controller.connected:
+            return
+        for side, block in (("l", left), ("r", right)):
+            if not block or len(block) != 11:
+                continue
+            previous = self._last_trigger_blocks.get(side)
+            if previous == block:
+                continue
+            # 主机在开车/刹车时发 0x05（HID 里是 Off）但带非零参数，
+            # 实际含义是「反馈阻力」；实机验证改写成 0x21 后油门/刹车阻尼正常。
+            block = bytearray(block)
+            if block[0] == 0x05 and any(block[1:]):
+                block[0] = 0x21
+            block = bytes(block)
+            self._last_trigger_blocks[side] = block
+            self._trigger_effect_time[side] = time.monotonic()
+            logging.getLogger("ps5kbm.trigger").debug(
+                "扳机效果 %s 类型 0x%02X：%s", side, block[0], block.hex()
+            )
+            self._controller.set_trigger_effect(side, block)
+
+    def stop_trigger_effect(self) -> None:
+        """立刻停掉两边的扳机效果（不受开关影响，任何时候都能放掉）。"""
+        if not self._controller.connected:
+            self._append_log("手柄没连上，没法停扳机效果")
+            return
+        self._controller.clear_trigger_effect("r")
+        self._controller.clear_trigger_effect("l")
+        self._last_trigger_blocks.clear()
+        self._trigger_effect_var.set("关闭")
+        self._append_log("已停止扳机效果（R2 / L2）")
+
+    def _toggle_adaptive_triggers(self) -> None:
+        enabled = bool(self._adaptive_trigger_var.get())
+        self._config.controller.adaptive_triggers = enabled
+        if not enabled and self._controller.connected:
+            # 关掉开关时顺手把已经写进去的效果放掉，避免扳机一直硬着
+            self._controller.clear_trigger_effect("r")
+            self._controller.clear_trigger_effect("l")
+        if not enabled:
+            self._last_trigger_blocks.clear()
+        self._append_log(
+            "自适应扳机：" + ("开启" if enabled else "关闭") + "（本地效果可用）"
+        )
+        self._persist()
+
+    def _toggle_diagnostics(self) -> None:
+        """抓包诊断：记录远端下发的负载类型，用来确认震动 / 扳机数据走哪条通道。"""
+        enabled = bool(self._diagnostics_var.get())
+        bridge.set_diagnostics(enabled)
+        self._append_log(
+            "抓包诊断："
+            + ("开启（日志里会记录非 AV 包与负载类型，连一局游戏即可采到）" if enabled else "关闭")
+        )
+
+    def apply_trigger_effect(self) -> None:
+        """本地测试自适应扳机效果（写入手柄，不依赖主机下发）。"""
+        if not self._config.controller.adaptive_triggers:
+            self._append_log("先打开「自适应扳机」开关，再试效果")
+            return
+        if not self._controller.connected:
+            self._append_log("先接上手柄再试扳机效果")
+            return
+        name = self._trigger_effect_var.get()
+        side = self._trigger_side_var.get()
+        sides = ("r", "l") if side == "双" else (("r",) if side == "R2" else ("l",))
+        if name == "关闭":
+            for item in sides:
+                self._controller.clear_trigger_effect(item)
+            self._append_log("已关闭扳机效果" + ("（双）" if side == "双" else f"（{side}）"))
+            return
+        effect = dualsense.effect_bytes(name)
+        ok = True
+        for item in sides:
+            ok = self._controller.set_trigger_effect(item, effect) and ok
+        self._append_log(
+            f"扳机效果：{name}"
+            + ("（双）" if side == "双" else f"（{side}）")
+            + ("" if ok else " · 写入失败")
+        )
+
+    # ------------------------------------------------------------ 手柄发送
+    def _tick_controller(self, dt: float, now: float) -> None:
+        """手柄模式的一帧：直通按键/摇杆/扳机 + 叠加陀螺仪。"""
+        if self._pending_controller_release:
+            self._pending_controller_release = False
+            self._release_controller_inputs()
+        state = self._controller.snapshot()
+        if state is None:
+            return
+        left, right = self._compose_controller_sticks(state, dt)
+        changed = (left, right) != self._last_ctrl_sticks
+        if changed or now - self._last_ctrl_send >= 0.0166:
+            self._last_ctrl_send = now
+            self._last_ctrl_sticks = (left, right)
+            self._bridge.set_sticks(left, right)
+        # 扳机走模拟量事件，变化超过 1/100 才发
+        for name, value in (("l2", state.l2), ("r2", state.r2)):
+            # 有扳机阻力时，浅松可能残留 0.05~0.15 的读数；
+            # 这个区间游戏本来就不算按下，直接按 0 发，避免“浅出识别不到”。
+            value = 0.0 if value < 0.15 else value
+            last = self._last_trigger_sent.get(name, 0.0)
+            pressed = value > 0.15
+            if self._trigger_pressed.get(name) and not pressed:
+                # 松开瞬间强制发一次 0，并清掉陀螺仪残留，避免“按着不放”的错觉
+                self._last_trigger_sent[name] = 0.0
+                self._bridge.set_trigger(name, 0.0)
+                self._gyro_axis.reset()
+                self._gyro_output = (0.0, 0.0)
+            elif abs(value - last) >= 0.01:
+                self._last_trigger_sent[name] = value
+                self._bridge.set_trigger(name, value)
+            self._trigger_pressed[name] = pressed
+        pressed = {name for name in state.buttons if name not in ("L2", "R2")}
+        events: list[tuple[str, str]] = []
+        for name in sorted(pressed - self._controller_buttons_sent):
+            events.append((name, "press"))
+        for name in sorted(self._controller_buttons_sent - pressed):
+            events.append((name, "release"))
+        if events:
+            self._controller_buttons_sent = set(pressed)
+            self._bridge.send_events(events)
+        # 陀螺仪排查：激活期间每 0.5 秒记一行原始值 + 输出值
+        if self._config.controller.gyro.enabled and self._gyro_active(state):
+            if now - self._gyro_trace_last >= 0.5:
+                self._gyro_trace_last = now
+                logging.getLogger("ps5kbm.gyro").debug(
+                    "陀螺仪 gyro=(%+.2f,%+.2f,%+.2f) out=(%+.2f,%+.2f) 右摇杆=(%+.2f,%+.2f)",
+                    state.gyro[0],
+                    state.gyro[1],
+                    state.gyro[2],
+                    self._gyro_output[0],
+                    self._gyro_output[1],
+                    right[0],
+                    right[1],
+                )
+        # 界面读数限速：tick 是 250Hz，每帧都发会把界面线程压死（实测会“未响应”）
+        if now - self._last_ui_sticks >= 0.05:
+            self._last_ui_sticks = now
+            self._ui_queue.put(("sticks", (left, right)))
+
+    def _compose_controller_sticks(self, state, dt: float):
+        """手柄摇杆 + 陀螺仪贡献（按住激活键时）。"""
+        left = (state.lx, state.ly)
+        right_x, right_y = state.rx, state.ry
+        cfg = self._config.controller.gyro
+        if cfg.enabled:
+            gx, gy = self._gyro_axis.update(
+                state.gyro,
+                self._gyro_bias,
+                self._gyro_params(),
+                dt,
+                self._gyro_active(state),
+            )
+            self._gyro_output = (gx, gy)
+            right_x = gyro.clamp(right_x + gx)
+            right_y = gyro.clamp(right_y + gy)
+        else:
+            self._gyro_output = (0.0, 0.0)
+        return left, (right_x, right_y)
+
+    def _release_controller_inputs(self) -> None:
+        """松开手柄发出去的所有输入（切模式/断连时调用，跑在事件循环线程）。"""
+        if self._bridge is None:
+            self._controller_buttons_sent.clear()
+            self._last_trigger_sent.clear()
+            return
+        events = [(name, "release") for name in sorted(self._controller_buttons_sent)]
+        self._controller_buttons_sent.clear()
+        if events:
+            self._bridge.send_events(events)
+        for name in ("l2", "r2"):
+            self._bridge.set_trigger(name, 0.0)
+        self._last_trigger_sent.clear()
+        self._bridge.set_sticks((0.0, 0.0), (0.0, 0.0))
+        self._gyro_axis.reset()
+        self._gyro_output = (0.0, 0.0)
+        self._last_ctrl_sticks = ((0.0, 0.0), (0.0, 0.0))
 
     # ------------------------------------------------------------ 映射编辑
     def _mode_cfg(self, name: str | None = None) -> config.ModeConfig:
@@ -1436,6 +2013,10 @@ class Ps5KbmApp:
 
     # ------------------------------------------------------------ 杂项
     def _append_log(self, text: str) -> None:
+        # Tk 只能在主线程碰；后台线程误调时转回界面线程
+        if threading.current_thread() is not threading.main_thread():
+            self._ui_queue.put(("log", text))
+            return
         self._log_text.configure(state="normal")
         self._log_text.insert("end", text + "\n")
         # 长时间挂着日志会无限变长（内存与滚动都越来越慢），超过上限裁掉最旧的
@@ -1451,40 +2032,67 @@ class Ps5KbmApp:
         self._log_text.configure(state="disabled")
 
     def _poll_events(self) -> None:
-        try:
-            while True:
-                self._append_log(self._log_queue.get_nowait())
-        except queue.Empty:
-            pass
-        try:
-            while True:
+        # 每轮最多处理固定条数：万一某个生产者瞬间刷屏，也不能让界面线程
+        # 卡在 while True 里几秒（Windows 会直接判定“未响应”）。剩余的下轮再消化。
+        for _ in range(100):
+            try:
+                message = self._log_queue.get_nowait()
+            except queue.Empty:
+                break
+            self._append_log(message)
+        for _ in range(200):
+            try:
                 kind, value = self._ui_queue.get_nowait()
-                if kind == "capture":
-                    self._apply_capture_state(value)
-                elif kind == "probe":
-                    self._apply_probe_result(value)
-                elif kind == "stick":
-                    self._apply_stick_value(value)
-                elif kind == "sticks":
-                    self._apply_stick_pair(value)
-                elif kind == "key":
-                    self._apply_key_state(value)
-                elif kind == "adjust":
-                    self._apply_adjust(value)
-                elif kind == "mode":
-                    self._edit_mode = value
-                    self._refresh_mode_ui()
-                    label = self._mode_label(value)
-                    self._overlay.set_mode_text(label)
-                    self._append_log(f"切换到模式：{label}")
-        except queue.Empty:
-            pass
+            except queue.Empty:
+                break
+            if kind == "capture":
+                self._apply_capture_state(value)
+            elif kind == "probe":
+                self._apply_probe_result(value)
+            elif kind == "stick":
+                self._apply_stick_value(value)
+            elif kind == "sticks":
+                self._apply_stick_pair(value)
+            elif kind == "key":
+                self._apply_key_state(value)
+            elif kind == "adjust":
+                self._apply_adjust(value)
+            elif kind == "mode":
+                self._edit_mode = value
+                self._refresh_mode_ui()
+                label = self._mode_label(value)
+                self._overlay.set_mode_text(label)
+                self._append_log(f"切换到模式：{label}")
+            elif kind == "session_lost":
+                if self._bridge is not None:
+                    self._append_log(
+                        "Remote Play 会话已断开（主机端关闭或网络中断），已自动断开"
+                    )
+                    self._disconnect()
+            elif kind == "heartbeat":
+                try:
+                    self._run_subtitle.configure(text=f"已发送 {value} 帧输入")
+                except Exception:  # noqa: BLE001 - 页面没建好时忽略
+                    pass
+            elif kind == "log":
+                self._append_log(value)
         self.root.after(120, self._poll_events)
 
     def _on_close(self) -> None:
         self._running = False
+        # 先取消手柄轮询定时器，否则关窗时 Tk 会报 invalid command name
+        try:
+            if self._poll_job is not None:
+                self.root.after_cancel(self._poll_job)
+                self._poll_job = None
+        except Exception:  # noqa: BLE001
+            pass
         try:
             self._overlay.hide()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._controller.stop()
         except Exception:  # noqa: BLE001
             pass
         try:

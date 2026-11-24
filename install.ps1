@@ -44,7 +44,7 @@ Write-Host "[2/3] installing playdirector without netifaces (vendor shim is used
 & $Python -m pip install --no-deps playdirector
 
 Write-Host "[3/3] installing dependencies"
-& $Python -m pip install aiohttp async-timeout pyps4-2ndscreen cryptography pycryptodomex "protobuf>=4.21.1,<7" requests "pyee>=12,<13" pyyaml cffi pynput psutil customtkinter
+& $Python -m pip install aiohttp async-timeout pyps4-2ndscreen cryptography pycryptodomex "protobuf>=4.21.1,<7" requests "pyee>=12,<13" pyyaml cffi pynput psutil customtkinter hidapi
 
 Write-Host ""
 Write-Host "Done. Next steps:"

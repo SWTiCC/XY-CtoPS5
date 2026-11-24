@@ -269,5 +269,87 @@ class RobustnessTests(unittest.TestCase):
         self.assertAlmostEqual(loaded.l2_depth, 0.25)
 
 
+class ControllerConfigTests(unittest.TestCase):
+    """手柄页配置：默认值、读写往返、非法值回落。"""
+
+    def test_defaults(self):
+        cfg = config.build_config({})
+        self.assertEqual(cfg.controller.mode, "keyboard")
+        self.assertTrue(cfg.controller.gyro.enabled)
+        self.assertEqual(cfg.controller.gyro.activation, "l2")
+        self.assertTrue(cfg.controller.rumble_enabled)
+        self.assertTrue(cfg.controller.adaptive_triggers)
+        self.assertEqual(list(cfg.controller.gyro.bias), [0.0, 0.0, 0.0])
+
+    def test_roundtrip(self):
+        raw = {
+            "controller": {
+                "mode": "controller",
+                "gyro": {
+                    "enabled": False,
+                    "activation": "l1",
+                    "sensitivity_x": 1.5,
+                    "sensitivity_y": 0.7,
+                    "deadzone": 0.03,
+                    "smoothing": 0.4,
+                    "invert_x": True,
+                    "invert_y": True,
+                    "bias": [0.01, -0.02, 0.03],
+                },
+                "rumble_enabled": False,
+                "rumble_gain": 1.5,
+                "adaptive_triggers": True,
+            }
+        }
+        cfg = config.build_config(raw)
+        self.assertEqual(cfg.controller.mode, "controller")
+        self.assertFalse(cfg.controller.gyro.enabled)
+        self.assertEqual(cfg.controller.gyro.activation, "l1")
+        self.assertAlmostEqual(cfg.controller.gyro.sensitivity_x, 1.5)
+        self.assertAlmostEqual(cfg.controller.gyro.bias[1], -0.02)
+        self.assertAlmostEqual(cfg.controller.rumble_gain, 1.5)
+        self.assertTrue(cfg.controller.adaptive_triggers)
+
+        rebuilt = config.build_config(config.config_to_dict(cfg))
+        self.assertEqual(rebuilt.controller.mode, "controller")
+        self.assertEqual(rebuilt.controller.gyro.activation, "l1")
+        self.assertAlmostEqual(rebuilt.controller.gyro.deadzone, 0.03)
+        self.assertAlmostEqual(rebuilt.controller.gyro.bias[2], 0.03)
+        self.assertTrue(rebuilt.controller.gyro.invert_x)
+
+    def test_invalid_values_fall_back(self):
+        cfg = config.build_config(
+            {
+                "controller": {
+                    "mode": "手柄",
+                    "gyro": {
+                        "activation": "没有这个键",
+                        "sensitivity_x": 99,
+                        "sensitivity_y": -5,
+                        "deadzone": 9,
+                        "smoothing": -1,
+                        "bias": "坏数据",
+                    },
+                    "rumble_gain": 9,
+                }
+            }
+        )
+        self.assertEqual(cfg.controller.mode, "keyboard")
+        self.assertEqual(cfg.controller.gyro.activation, "l2")
+        self.assertAlmostEqual(cfg.controller.gyro.sensitivity_x, 3.0)
+        self.assertAlmostEqual(cfg.controller.gyro.sensitivity_y, 0.1)
+        self.assertAlmostEqual(cfg.controller.gyro.deadzone, 0.1)
+        self.assertAlmostEqual(cfg.controller.gyro.smoothing, 0.0)
+        self.assertEqual(list(cfg.controller.gyro.bias), [0.0, 0.0, 0.0])
+        self.assertAlmostEqual(cfg.controller.rumble_gain, 2.0)
+
+    def test_custom_activation_button_is_kept(self):
+        for name in ("r2", "r1", "cross", "touchpad", "always"):
+            cfg = config.build_config(
+                {"controller": {"gyro": {"activation": name}}}
+            )
+            self.assertEqual(cfg.controller.gyro.activation, name)
+
+
 if __name__ == "__main__":
     unittest.main()

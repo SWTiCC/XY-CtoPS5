@@ -96,7 +96,7 @@ def _build_host_card(app, parent) -> None:
 
     # CTkScrollableFrame 内部的滚动条默认长度会把整张卡片撑高（要 96 的列表能撑到
     # 200+），这里用固定高度的容器包一层，保证列表区高度可控、不顶掉下面的按钮。
-    holder = ctk.CTkFrame(host_card, fg_color="transparent", height=T.S8 * 3)
+    holder = ctk.CTkFrame(host_card, fg_color="transparent", height=T.S8 * 2)
     holder.pack(fill="x", padx=T.S4, pady=(0, T.S4))
     holder.pack_propagate(False)
     app._device_list = ctk.CTkScrollableFrame(
@@ -133,11 +133,49 @@ def _build_pair_card(app, parent) -> None:
     ).pack(fill="x", padx=T.S4, pady=(0, T.S4))
 
 
+def build_mode_selector(app, parent):
+    """玩法选择（键鼠 / 手柄）——快捷视图和完整流程共用同一个变量。"""
+    return ctk.CTkSegmentedButton(
+        parent,
+        values=["键鼠", "手柄"],
+        variable=app._input_mode_var,
+        command=app.set_input_mode,
+        font=font(T.XS),
+        selected_color=T.ACCENT,
+        selected_hover_color=T.ACCENT_HOVER,
+        unselected_color=T.SURFACE_HOVER,
+        unselected_hover_color=T.BORDER,
+        text_color=T.TEXT,
+        height=30,
+        width=150,
+    )
+
+
 def _build_action_row(app, parent) -> None:
     row = ctk.CTkFrame(parent, fg_color="transparent")
     row.pack(fill="x", pady=(T.S2, 0))
+    ctk.CTkLabel(
+        row, text="玩法", font=font(T.XS), text_color=T.TEXT_DIM
+    ).pack(side="left", padx=(0, T.S2))
+    build_mode_selector(app, row).pack(side="left")
     app._connect_button = primary_button(row, "连接主机", app._connect, width=180)
-    app._connect_button.pack(side="left")
+    app._connect_button.pack(side="left", padx=(T.S4, 0))
     app._disconnect_button = secondary_button(row, "断开", app._disconnect, width=96)
     app._disconnect_button.pack(side="left", padx=T.S2)
     app._disconnect_button.configure(state="disabled")
+    app._wake_button = secondary_button(row, "唤醒主机", app._wake_console, width=110)
+    app._wake_button.pack(side="left")
+    app._wake_buttons.append(app._wake_button)
+
+    ctk.CTkLabel(
+        parent,
+        text=(
+            "注意：PS5 停在登录 / 密码界面时 Remote Play 连不上——先在主机上完成登录，"
+            "并到「设置 → 用户与账户 → 登录设置」打开自动登录。"
+        ),
+        font=font(T.XS),
+        text_color=T.TEXT_FAINT,
+        anchor="w",
+        justify="left",
+        wraplength=640,
+    ).pack(fill="x", pady=(T.S1, 0))

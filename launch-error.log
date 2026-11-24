@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "E:\Code Project\CtoPS5\launch.pyw", line 67, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "E:\Code Project\CtoPS5\launch.pyw", line 61, in main
+    return app_main()
+           ^^^^^^^^^^
+  File "E:\Code Project\CtoPS5\ps5kbm\app.py", line 2113, in main
+    Ps5KbmApp(root)
+  File "E:\Code Project\CtoPS5\ps5kbm\app.py", line 105, in __init__
+    self._usb_haptics = haptics_usb.UsbHaptics()
+                        ^^^^^^^^^^^
+NameError: name 'haptics_usb' is not defined

@@ -179,6 +179,37 @@ class LeftStickConfig:
 
 
 @dataclass
+class GyroConfig:
+    """DualSense 陀螺仪 → 右摇杆的参数（见 ps5kbm/gyro.py）。"""
+
+    enabled: bool = True
+    # 激活方式：always 或手柄按键名（l2 / l1 / r1 / cross…）
+    activation: str = "l2"
+    sensitivity_x: float = 1.0
+    sensitivity_y: float = 1.0
+    deadzone: float = 0.02
+    smoothing: float = 0.3
+    invert_x: bool = False
+    invert_y: bool = False
+    # 校准得到的零偏（rad/s），保存下来省得每次重开都重新校准
+    bias: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0])
+
+
+@dataclass
+class ControllerConfig:
+    """手柄页的全局设置（不随预设切换）。"""
+
+    # 输入模式：keyboard = 键鼠映射；controller = DualSense 直通
+    mode: str = "keyboard"
+    gyro: GyroConfig = field(default_factory=GyroConfig)
+    rumble_enabled: bool = True
+    # USB 连接时的原生触觉（写入 DualSense 音频端点 3/4 声道）
+    haptics_usb: bool = False
+    rumble_gain: float = 1.0
+    adaptive_triggers: bool = True
+
+
+@dataclass
 class ModeConfig:
     """一套完整的按键映射（一个“模式”）。
 
@@ -214,6 +245,8 @@ class AppConfig:
     # 按下扳机时输出的深度（0~1）：运行页滑条/调参键改的就是它，存 tuning.json
     r2_depth: float = 1.0
     l2_depth: float = 1.0
+    # 手柄直通 / 陀螺仪 / 震动（手柄页）
+    controller: ControllerConfig = field(default_factory=ControllerConfig)
     # 多模式映射：键是模式 id，至少包含 "default"
     modes: dict[str, ModeConfig] = field(default_factory=dict)
     current_mode: str = "default"
@@ -412,6 +445,76 @@ def _build_left_stick(raw: dict) -> LeftStickConfig:
     return build_left_stick(raw)
 
 
+GYRO_ACTIVATIONS = ("always",) + tuple(
+    name.lower()
+    for name in (
+        "L2",
+        "L1",
+        "R2",
+        "R1",
+        "L3",
+        "R3",
+        "SQUARE",
+        "CROSS",
+        "CIRCLE",
+        "TRIANGLE",
+        "SHARE",
+        "OPTIONS",
+        "TOUCHPAD",
+        "MUTE",
+        "PS",
+    )
+)
+CONTROLLER_MODES = ("keyboard", "controller")
+
+
+def _clamp(value: object, low: float, high: float, default: float) -> float:
+    """任意浮点参数：越界夹紧，非法值用默认。"""
+    try:
+        return max(low, min(high, float(value)))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+
+
+def _build_gyro(raw: dict) -> GyroConfig:
+    raw = raw or {}
+    activation = str(raw.get("activation", "l2")).strip().lower()
+    if activation not in GYRO_ACTIVATIONS:
+        activation = "l2"
+    bias_raw = raw.get("bias") or [0.0, 0.0, 0.0]
+    try:
+        bias = [float(item) for item in bias_raw][:3]
+    except (TypeError, ValueError):
+        bias = []
+    bias += [0.0] * (3 - len(bias))
+    return GyroConfig(
+        enabled=bool(raw.get("enabled", True)),
+        activation=activation,
+        sensitivity_x=_clamp(raw.get("sensitivity_x", 1.0), 0.1, 3.0, 1.0),
+        sensitivity_y=_clamp(raw.get("sensitivity_y", 1.0), 0.1, 3.0, 1.0),
+        deadzone=_clamp(raw.get("deadzone", 0.02), 0.0, 0.1, 0.02),
+        smoothing=_clamp(raw.get("smoothing", 0.3), 0.0, 0.9, 0.3),
+        invert_x=bool(raw.get("invert_x", False)),
+        invert_y=bool(raw.get("invert_y", False)),
+        bias=bias,
+    )
+
+
+def _build_controller(raw: dict) -> ControllerConfig:
+    raw = raw or {}
+    mode = str(raw.get("mode", "keyboard")).strip().lower()
+    if mode not in CONTROLLER_MODES:
+        mode = "keyboard"
+    return ControllerConfig(
+        mode=mode,
+        gyro=_build_gyro(raw.get("gyro") or {}),
+        rumble_enabled=bool(raw.get("rumble_enabled", True)),
+        haptics_usb=bool(raw.get("haptics_usb", False)),
+        rumble_gain=_clamp(raw.get("rumble_gain", 1.0), 0.0, 2.0, 1.0),
+        adaptive_triggers=bool(raw.get("adaptive_triggers", True)),
+    )
+
+
 def build_config(raw: dict) -> AppConfig:
     """把合并后的字典转成 AppConfig。
 
@@ -453,6 +556,7 @@ def build_config(raw: dict) -> AppConfig:
         target_window=str(raw.get("target_window", "")),
         r2_depth=_clamp01(raw.get("r2_depth", 1.0)),
         l2_depth=_clamp01(raw.get("l2_depth", 1.0)),
+        controller=_build_controller(raw.get("controller") or {}),
         modes=modes,
         current_mode=current,
     )
@@ -627,6 +731,24 @@ def config_to_dict(cfg: AppConfig) -> dict:
         },
         "r2_depth": cfg.r2_depth,
         "l2_depth": cfg.l2_depth,
+        "controller": {
+            "mode": cfg.controller.mode,
+            "gyro": {
+                "enabled": cfg.controller.gyro.enabled,
+                "activation": cfg.controller.gyro.activation,
+                "sensitivity_x": cfg.controller.gyro.sensitivity_x,
+                "sensitivity_y": cfg.controller.gyro.sensitivity_y,
+                "deadzone": cfg.controller.gyro.deadzone,
+                "smoothing": cfg.controller.gyro.smoothing,
+                "invert_x": cfg.controller.gyro.invert_x,
+                "invert_y": cfg.controller.gyro.invert_y,
+                "bias": list(cfg.controller.gyro.bias),
+            },
+            "rumble_enabled": cfg.controller.rumble_enabled,
+            "haptics_usb": cfg.controller.haptics_usb,
+            "rumble_gain": cfg.controller.rumble_gain,
+            "adaptive_triggers": cfg.controller.adaptive_triggers,
+        },
         # 同时写顶层的 default 映射（兼容旧版读取）和多模式结构
         "keyboard_sticks": default_mode.keyboard_sticks,
         "keyboard_buttons": default_mode.keyboard_buttons,

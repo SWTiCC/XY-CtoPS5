@@ -41,7 +41,12 @@ def build_sidebar(app, body) -> None:
     sidebar.pack_propagate(False)
 
     app._nav_buttons: dict[str, ctk.CTkButton] = {}
-    items = (("connect", "连接"), ("mapping", "映射"), ("run", "运行"))
+    items = (
+        ("connect", "连接"),
+        ("controller", "手柄"),
+        ("mapping", "映射"),
+        ("run", "运行"),
+    )
     for key, label in items:
         button = ctk.CTkButton(
             sidebar,
@@ -64,6 +69,22 @@ def build_sidebar(app, body) -> None:
     ctk.CTkLabel(
         sidebar, text=f"v{APP_VERSION}", font=font(T.XS), text_color=T.TEXT_FAINT
     ).pack(side="bottom", anchor="w")
+
+
+def set_nav_visible(app, names: set[str]) -> None:
+    """只显示当前玩法相关的页签（未连接时只有「连接」）。
+
+    全部先 forget 再按固定顺序 pack，避免 pack 顺序被打乱。
+    """
+    order = ("connect", "controller", "mapping", "run")
+    for key in order:
+        button = app._nav_buttons.get(key)
+        if button is not None:
+            button.pack_forget()
+    for key in order:
+        button = app._nav_buttons.get(key)
+        if button is not None and key in names:
+            button.pack(fill="x", pady=(0, T.S1))
 
 
 def set_nav_state(app, active: str) -> None:
