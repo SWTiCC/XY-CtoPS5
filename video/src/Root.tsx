@@ -1,5 +1,6 @@
 import { Composition } from 'remotion';
-import { Ps5Main, PS5_TOTAL } from './ps5/Main';
+import { Ps5Main } from './ps5/Main';
+import { PS5_TOTAL } from './ps5/timeline';
 
 export const Root: React.FC = () => {
   return (
