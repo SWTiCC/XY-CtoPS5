@@ -1,7 +1,7 @@
 # XY-CtoPS5
 
-> 把 PC 的**键盘鼠标**变成 **PS5 的手柄输入**，通过 Remote Play 输入通道发送。
-> Turn your PC **keyboard & mouse** into a virtual **DualShock 4** for PS5 over Remote Play.
+> 把 PC 的**键鼠**或 **DualSense 手柄**变成 PS5 的输入，通过 Remote Play 通道发送。
+> Use your PC **keyboard & mouse** or a **DualSense controller** as PS5 input over Remote Play.
 
 [![License: GPL-3.0](https://img.shields.io/badge/License-GPL%203.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-lightgrey)
@@ -10,7 +10,14 @@
 
 **中文文档** | [English](#english)
 
-> **0.3.0 更新**：新增「手柄玩法」——DualSense 直通（蓝牙/USB）、陀螺仪→右摇杆、主机下发的自适应扳机（开枪/发动/油门刹车）、USB 原生触觉（实验性）。键鼠玩法保持原样。详见 [CHANGELOG](CHANGELOG.md) 与 [0.3.0 更新说明](docs/release-0.3.0.md)。
+## 两种玩法（平级）
+
+| 玩法 | 输入 | 适合 |
+|---|---|---|
+| **键鼠玩法** | 键盘映射手柄按键 + 鼠标→右摇杆（Raw Input / Flick Stick / 两段灵敏度） | 射击、需要精细瞄准的游戏 |
+| **手柄玩法** | DualSense 直通（蓝牙 / USB）：按键、摇杆、扳机模拟量 | 想用真手柄手感、要陀螺仪/自适应扳机的游戏 |
+
+连接页选择玩法，连接成功后只显示对应页签。详见 [CHANGELOG](CHANGELOG.md) 与 [0.3.0 更新说明](docs/release-0.3.0.md)。
 
 ---
 
@@ -27,6 +34,21 @@ PS5 主机**不直接支持键盘鼠标**。本工具在 PC 上建立一条 Remo
 ---
 
 ## 功能特性
+
+### 手柄玩法：DualSense 直通 + 陀螺仪
+
+![手柄页](docs/images/controller-page.png)
+
+| 能力 | 说明 |
+|---|---|
+| **DualSense 直通** | 蓝牙 / USB 均可；按键、摇杆、L2/R2 模拟量原样发给主机 |
+| **陀螺仪 → 右摇杆** | 按住激活键（默认 L2，可改任意键）时用体感微调视角，松手立刻停 |
+| **陀螺仪调校** | 水平/垂直灵敏度、死区、平滑、反 X / 反 Y；roll 方向已按实机校正 |
+| **自动校准** | 手柄平放稳定 3 秒自动完成并关闭，显示质量（优 / 良 / 一般） |
+| **自适应扳机（主机下发）** | 开枪（0x25）、发动（0x21）、开车油门/刹车（wire 0x05 → 0x21）实机验证；游戏驱动，无需配置 |
+| **扳机本地测试** | 阻力 / 开枪 / 震动 / 拉弓四种效果 + 强度档位 + 停止 |
+| **USB 原生触觉（实验性）** | 解码主机 haptics 音频写入 DualSense 3/4 声道，默认关闭、手感待标定 |
+| **主机与手柄状态** | 电量 / 充电 / 蓝牙·USB；未连接时给出配对提示；手柄玩法下可直接唤醒主机 |
 
 ### 鼠标 → 右摇杆
 
