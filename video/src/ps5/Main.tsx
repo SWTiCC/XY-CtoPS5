@@ -110,7 +110,7 @@ const Backdrop: React.FC<{ accent?: string }> = ({ accent = CYAN }) => {
           height: 2,
           top: scan,
           background: `linear-gradient(90deg, transparent, ${alpha(accent, 0.55)}, transparent)`,
-          opacity: 0.18,
+          opacity: 0.08,
         }}
       />
       {/* 暗角 */}
@@ -433,17 +433,17 @@ const SceneDiagram: React.FC = () => {
         </div>
       </div>
       {/* 画面路 */}
-      <NodeCard x={110} y={240} label="PS5" sub="游戏主机" delay={8} color={CYAN} />
-      <NodeCard x={720} y={240} label="采集卡" sub="HDMI 环出 · 低延迟" delay={16} color={BLUE} />
-      <NodeCard x={1330} y={240} label="画面" sub="PC 上显示" delay={24} color={BLUE} />
-      <FlowLine x1={430} x2={700} y={324} delay={30} color={BLUE} label="HDMI" />
-      <FlowLine x1={1040} x2={1310} y={324} delay={40} color={BLUE} label="CAPTURE" />
+      <NodeCard x={200} y={240} label="PS5" sub="游戏主机" delay={8} color={CYAN} />
+      <NodeCard x={810} y={240} label="采集卡" sub="HDMI 环出 · 低延迟" delay={16} color={BLUE} />
+      <NodeCard x={1420} y={240} label="画面" sub="PC 上显示" delay={24} color={BLUE} />
+      <FlowLine x1={520} x2={790} y={324} delay={30} color={BLUE} label="HDMI" />
+      <FlowLine x1={1130} x2={1400} y={324} delay={40} color={BLUE} label="CAPTURE" />
       {/* 输入路 */}
-      <NodeCard x={110} y={620} label="键鼠 / 手柄" sub="你的操作" delay={56} color={PURPLE} />
-      <NodeCard x={720} y={620} label="Remote Play" sub="输入通道" delay={64} color={PURPLE} />
-      <NodeCard x={1330} y={620} label="虚拟手柄" sub="伪装成 DualShock" delay={72} color={CYAN} />
-      <FlowLine x1={430} x2={700} y={704} delay={78} color={PURPLE} label="INPUT" />
-      <FlowLine x1={1040} x2={1310} y={704} delay={88} color={PURPLE} label="PAD" />
+      <NodeCard x={200} y={620} label="键鼠 / 手柄" sub="你的操作" delay={56} color={PURPLE} />
+      <NodeCard x={810} y={620} label="Remote Play" sub="输入通道" delay={64} color={PURPLE} />
+      <NodeCard x={1420} y={620} label="虚拟手柄" sub="伪装成 DualShock" delay={72} color={CYAN} />
+      <FlowLine x1={520} x2={790} y={704} delay={78} color={PURPLE} label="INPUT" />
+      <FlowLine x1={1130} x2={1400} y={704} delay={88} color={PURPLE} label="PAD" />
       <Cap text="画面：采集卡  /  输入：Remote Play" from={24} />
       <Audio src={staticFile(VOICE_OF('diagram'))} />
     </AbsoluteFill>
@@ -455,7 +455,7 @@ const SceneDiagram: React.FC = () => {
 // ---------------------------------------------------------------------------
 const ShotModes: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.272, y: 0.143, w: 0.695, h: 0.07, head: 'MODE', detail: '玩法：键鼠 / 手柄', tag: 'below' },
+    { x: 0.272, y: 0.143, w: 0.695, h: 0.07, head: 'MODE', detail: '玩法：键鼠 / 手柄' },
   ];
   return (
     <ScanShot
@@ -471,8 +471,8 @@ const ShotModes: React.FC = () => {
 
 const ShotConnect1: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.273, y: 0.289, w: 0.36, h: 0.07, head: 'HOST', detail: '填 IP 或扫描局域网', tag: 'right' },
-    { x: 0.273, y: 0.587, w: 0.5, h: 0.148, head: 'PAIR', detail: 'Account ID + 8 位 PIN', tag: 'right' },
+    { x: 0.273, y: 0.289, w: 0.36, h: 0.07, head: 'HOST', detail: '填 IP 或扫描局域网' },
+    { x: 0.273, y: 0.587, w: 0.5, h: 0.148, head: 'PAIR', detail: 'Account ID + 8 位 PIN' },
   ];
   return (
     <ScanShot
@@ -488,7 +488,7 @@ const ShotConnect1: React.FC = () => {
 
 const ShotConnect2: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.27, y: 0.324, w: 0.696, h: 0.205, head: 'PAIRED', detail: '已配对在线 → 直接连接', tag: 'below' },
+    { x: 0.27, y: 0.324, w: 0.696, h: 0.205, head: 'PAIRED', detail: '已配对在线 → 直接连接' },
   ];
   return (
     <ScanShot
@@ -504,8 +504,8 @@ const ShotConnect2: React.FC = () => {
 
 const ShotMapping1: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.273, y: 0.254, w: 0.667, h: 0.05, head: 'PRESET', detail: '预设 = 一整套按键', tag: 'below' },
-    { x: 0.273, y: 0.314, w: 0.667, h: 0.052, head: 'MODE', detail: '模式用切换键循环', tag: 'below' },
+    { x: 0.273, y: 0.254, w: 0.60, h: 0.05, head: 'PRESET', detail: '预设 = 一整套按键' },
+    { x: 0.273, y: 0.314, w: 0.60, h: 0.052, head: 'MODE', detail: '模式用切换键循环' },
   ];
   return (
     <ScanShot
@@ -521,8 +521,8 @@ const ShotMapping1: React.FC = () => {
 
 const ShotMapping2: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.291, y: 0.498, w: 0.653, h: 0.148, head: 'BIND', detail: '改键 / 编辑 / 删除 · 自动保存', tag: 'right' },
-    { x: 0.273, y: 0.722, w: 0.685, h: 0.052, head: 'STICK', detail: '左摇杆方向键单独编辑', tag: 'below' },
+    { x: 0.291, y: 0.498, w: 0.56, h: 0.148, head: 'BIND', detail: '改键 / 编辑 / 删除' },
+    { x: 0.273, y: 0.722, w: 0.60, h: 0.052, head: 'STICK', detail: '左摇杆方向键单独编辑' },
   ];
   return (
     <ScanShot
@@ -538,8 +538,8 @@ const ShotMapping2: React.FC = () => {
 
 const ShotController: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.277, y: 0.467, w: 0.709, h: 0.257, head: 'GYRO', detail: '陀螺仪 → 右摇杆', tag: 'right' },
-    { x: 0.277, y: 0.766, w: 0.47, h: 0.186, head: 'RUMBLE', detail: '震动转发 · 自适应扳机', tag: 'right' },
+    { x: 0.277, y: 0.467, w: 0.709, h: 0.257, head: 'GYRO', detail: '陀螺仪 → 右摇杆' },
+    { x: 0.277, y: 0.766, w: 0.60, h: 0.17, head: 'RUMBLE', detail: '震动转发 · 自适应扳机' },
   ];
   return (
     <ScanShot
@@ -555,14 +555,14 @@ const ShotController: React.FC = () => {
 
 const ShotRun1: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.28, y: 0.254, w: 0.656, h: 0.047, head: 'CAPTURE', detail: '开始捕获 / F8', tag: 'right' },
-    { x: 0.266, y: 0.72, w: 0.706, h: 0.051, head: 'WINDOW', detail: '捕获时切到的窗口', tag: 'below' },
+    { x: 0.285, y: 0.25, w: 0.40, h: 0.052, head: 'CAPTURE', detail: '开始捕获 / F8' },
+    { x: 0.266, y: 0.72, w: 0.706, h: 0.051, head: 'WINDOW', detail: '捕获时切到的窗口' },
   ];
   return (
     <ScanShot
       image="images/run-page-v3.png"
       title="开始捕获"
-      subtitle="先选窗口，再开始捕获；键鼠交给 PS5 后指针隐藏"
+      subtitle="先选窗口再开始捕获；捕获后指针隐藏"
       voice={VOICE_OF('run1')}
       targets={targets}
       index={7}
@@ -572,7 +572,7 @@ const ShotRun1: React.FC = () => {
 
 const ShotRun2: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.263, y: 0.4, w: 0.688, h: 0.196, head: 'AIM', detail: '死区 · 灵敏度 · 平滑 · 反死区', tag: 'below' },
+    { x: 0.263, y: 0.4, w: 0.688, h: 0.196, head: 'AIM', detail: '死区 · 灵敏度 · 平滑 · 反死区' },
   ];
   return (
     <ScanShot
@@ -588,7 +588,7 @@ const ShotRun2: React.FC = () => {
 
 const ShotRun3: React.FC = () => {
   const targets: ScanTarget[] = [
-    { x: 0.263, y: 0.592, w: 0.568, h: 0.098, head: 'TRIGGER', detail: 'R2 / L2 深度 · 滚轮调', tag: 'right' },
+    { x: 0.263, y: 0.592, w: 0.568, h: 0.098, head: 'TRIGGER', detail: 'R2 / L2 深度 · 滚轮调' },
   ];
   return (
     <ScanShot
@@ -633,6 +633,15 @@ const FullImageShot: React.FC<{ image: string; title: string; sub: string; voice
         >
           {title}
         </div>
+        <div
+          style={{
+            margin: '10px auto 0',
+            width: 132,
+            height: 2,
+            background: `linear-gradient(90deg, transparent, ${GOLD}, transparent)`,
+            boxShadow: `0 0 14px ${alpha(GOLD, 0.7)}`,
+          }}
+        />
       </div>
       <div
         style={{
@@ -643,8 +652,8 @@ const FullImageShot: React.FC<{ image: string; title: string; sub: string; voice
           height: 870,
           borderRadius: 12,
           overflow: 'hidden',
-          border: `1px solid ${alpha(GOLD, 0.3)}`,
-          boxShadow: `0 40px 120px rgba(0,0,0,0.75), 0 0 90px ${alpha(GOLD, 0.13)}`,
+          border: `1.5px solid ${alpha(GOLD, 0.55)}`,
+          boxShadow: `0 40px 120px rgba(0,0,0,0.75), 0 0 90px ${alpha(GOLD, 0.22)}`,
           opacity: enter,
           transform: `scale(${0.97 + enter * 0.03})`,
         }}
@@ -721,7 +730,19 @@ const SceneOutro: React.FC = () => {
         <div style={{ marginTop: 14, fontSize: 23, color: DIM, opacity: info, letterSpacing: 2 }}>
           键鼠 / DualSense 双玩法 · 一个安装程序
         </div>
-        <div style={{ marginTop: 40, fontFamily: MONO, fontSize: 15, color: alpha(DIM, 0.6), letterSpacing: 4, opacity: info }}>
+        <div
+          style={{
+            marginTop: 26,
+            fontFamily: MONO,
+            fontSize: 21,
+            color: alpha(TEXT, 0.85),
+            letterSpacing: 1.5,
+            opacity: info,
+          }}
+        >
+          github.com/SWTiCC/XY-CtoPS5
+        </div>
+        <div style={{ marginTop: 30, fontFamily: MONO, fontSize: 16, color: alpha(DIM, 0.85), letterSpacing: 4, opacity: info }}>
           HDMI CAPTURE + REMOTE PLAY · 仅建议单人单机游戏
         </div>
       </div>

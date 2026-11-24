@@ -1,12 +1,17 @@
 // 扫描取景镜头 —— 改编自 Video_Shotcraft 的 scanline-annotate-focus 镜头卡。
 //
-// 镜头卡原参数（钴蓝机器视线 × 暖沙官网）在这里按比例换算到 1120×933 的窗口，
-// 并把机器色换成产品青。以下参数是卡片里调校过的"命门"，不得随意降档：
+// 镜头卡原参数（钴蓝机器视线 × 暖沙官网）按比例换算到 1120×933 的窗口，机器色换成产品青。
+// 以下参数是卡片里调校过的"命门"，不得随意降档：
 //   · 扫描线严格匀速，不加缓动（加了就像有人在拖进度条）
 //   · 取景框 spring damping 15 / stiffness 210（一次可见过冲），从外扩 54px 收拢
 //   · 臂长晚 3 帧收一档 30→20（跟随感）
-//   · 标签在取景框落定后 5 帧才起，逐字打字 ~2.2 字/帧，签条宽度随字长
 //   · 触发帧 = 扫描线越过目标 bbox 下缘那一帧，按下缘排序后钳制最小间隔 8 帧
+//
+// 与镜头卡的一处关键偏离（终检后改）：
+//   卡片把文字标签贴在页面内 bbox 旁边。本项目截的是密集的桌面 UI，实测下来
+//   任何 below 落位都会压住下一行内容，密集两行时还会互相重叠、甚至被窗口裁掉。
+//   所以窗内只保留「取景框 + 左上角编号徽章」，文字全部移到左栏信息面板，
+//   框与文字靠编号 01/02 对应。字仍然逐字打出来，保留"机器在写"的感觉。
 import React from 'react';
 import { Audio, AbsoluteFill, Img, interpolate, spring, staticFile, useCurrentFrame, useVideoConfig } from 'remotion';
 import { CYAN, DIM, FPS, MONO, SANS, TEXT, alpha } from './theme';
@@ -20,14 +25,13 @@ export type ScanTarget = {
   y: number;
   w: number;
   h: number;
-  head: string; // 标签主名（等宽大写）
-  detail: string; // 标签副文
-  tag: 'right' | 'below';
+  head: string; // 编号旁的主名（等宽大写）
+  detail: string; // 左栏说明（逐字打出）
 };
 
 const Y0 = -20; // 扫描线起点（窗内 y）
-const Y1 = WIN.h + 20; // 扫描线终点
-const SCAN0 = 6; // 起扫帧
+const Y1 = WIN.h + 20;
+const SCAN0 = 6;
 
 const clamp01 = (v: number) => Math.max(0, Math.min(1, v));
 
@@ -37,7 +41,7 @@ const ramp = (frame: number, start: number, dur: number) =>
     extrapolateRight: 'clamp',
   });
 
-/** 计算每个目标的触发帧：扫描线越过 bbox 下缘那一帧，按上缘排序钳制最小间隔 */
+/** 计算每个目标的触发帧：扫描线越过 bbox 下缘那一帧，按时间排序后钳制最小间隔 */
 const scheduleTargets = (targets: ScanTarget[], scanSpan: number) => {
   const frameAtY = (yRel: number) => SCAN0 + ((yRel * WIN.h - Y0) / (Y1 - Y0)) * scanSpan;
   const list = targets.map((t) => ({ t, ft: frameAtY(t.y + t.h) }));
@@ -85,83 +89,66 @@ const Bracket: React.FC<{ t: ScanTarget; frame: number; fired: number }> = ({ t,
       <svg
         width={WIN.w}
         height={WIN.h}
-        style={{ position: 'absolute', left: 0, top: 0, overflow: 'visible', opacity: Math.min(1, (frame - fired) / 3) }}
+        style={{
+          position: 'absolute',
+          left: 0,
+          top: 0,
+          overflow: 'visible',
+          opacity: Math.min(1, (frame - fired) / 3),
+          // 深色截图上 2.6px 青线太弱，用投影补一圈外发光，才读得出"取景框"
+          filter: `drop-shadow(0 0 5px ${alpha(CYAN, 0.85)})`,
+        }}
       >
-        <path d={d} fill="none" stroke={CYAN} strokeWidth={2.6} strokeLinecap="round" strokeLinejoin="round" />
+        <path d={d} fill="none" stroke={CYAN} strokeWidth={3} strokeLinecap="round" strokeLinejoin="round" />
       </svg>
     </>
   );
 };
 
-// ───────────────────────── 打字标签 ─────────────────────────
-const TAG_H = 36;
-const TAG_FONT = 23;
-const CHAR_W = 0.6 * TAG_FONT;
+// ───────────────────────── 编号徽章（取代窗内文字标签）─────────────────────────
+const BADGE = 27;
 
-/** 中文字宽约 1em、等宽西文约 0.6em；按字符真实宽度累计，否则中文标签会算出偏窄的签条而溢出 */
-const textWidth = (text: string) => {
-  let w = 0;
-  for (const ch of text) {
-    w += /[\u3000-\u9fff\uff00-\uffef]/.test(ch) ? TAG_FONT : CHAR_W;
-  }
-  return w;
-};
-
-const Label: React.FC<{ t: ScanTarget; frame: number; fired: number }> = ({ t, frame, fired }) => {
-  const s0 = fired + 5;
-  if (frame < s0) return null;
-  const rise = ramp(frame, s0, 12);
-  const pop = ramp(frame, s0, 4);
-  const full = `${t.head} · ${t.detail}`;
-  const typedF = Math.min(full.length, (frame - s0) * 2.2 + 1); // 机器在写：~2.2 字/帧
-  const typed = Math.floor(typedF);
-  const finalW = Math.round(textWidth(full) + 26);
-  const nowW = Math.min(finalW, textWidth(full.slice(0, typed)) + 26);
-  const typing = typed < full.length;
-
-  // 右侧放不下就改放下方，避免标签溢出窗口
-  const rightFits = t.x + t.w + finalW / WIN.w < 1;
-  const useRight = t.tag === 'right' && rightFits;
-  const baseX = useRight ? (t.x + t.w) * WIN.w + 18 : t.x * WIN.w;
-  const baseY = useRight ? t.y * WIN.h + (t.h * WIN.h - TAG_H) / 2 : (t.y + t.h) * WIN.h + 14;
-
-  const head = full.slice(0, Math.min(typed, t.head.length));
-  const rest = typed > t.head.length ? full.slice(t.head.length, typed) : '';
+const Badge: React.FC<{ t: ScanTarget; frame: number; fired: number; order: number }> = ({
+  t,
+  frame,
+  fired,
+  order,
+}) => {
+  if (frame < fired) return null;
+  const pop = ramp(frame, fired + 4, 7);
+  // 贴在 bbox 左边缘外侧、沿高度居中：既不会压到框上方的说明行，也不会压到框内内容
+  const left = Math.min(WIN.w - BADGE - 6, Math.max(6, t.x * WIN.w - BADGE - 9));
+  const centerY = t.y * WIN.h + (t.h * WIN.h) / 2;
+  const top = Math.min(WIN.h - BADGE - 6, Math.max(6, centerY - BADGE / 2));
   return (
     <div
       style={{
         position: 'absolute',
-        left: baseX,
-        top: baseY,
-        width: nowW,
-        height: TAG_H,
-        borderRadius: 7,
+        left,
+        top,
+        width: BADGE,
+        height: BADGE,
+        borderRadius: 4,
         background: CYAN,
-        boxShadow: `0 8px 18px -8px ${alpha('#062033', 0.6)}, inset 0 1px 0 rgba(255,255,255,0.25)`,
-        opacity: pop,
-        overflow: 'hidden',
-        transform: `translateY(${(1 - rise) * 7}px)`,
         display: 'flex',
         alignItems: 'center',
-        paddingLeft: 13,
-        boxSizing: 'border-box',
+        justifyContent: 'center',
         fontFamily: MONO,
-        fontSize: TAG_FONT,
-        fontWeight: 600,
-        whiteSpace: 'pre',
+        fontSize: 14,
+        fontWeight: 800,
         color: '#04202b',
+        letterSpacing: 0,
+        opacity: pop,
+        transform: `scale(${0.55 + pop * 0.45})`,
+        boxShadow: `0 0 16px ${alpha(CYAN, 0.65)}, 0 2px 8px rgba(0,0,0,0.4)`,
       }}
     >
-      <span style={{ fontWeight: 800 }}>{head}</span>
-      <span style={{ fontWeight: 600, opacity: 0.72 }}>{rest}</span>
-      {typing ? (
-        <span style={{ display: 'inline-block', width: 11, height: 22, marginLeft: 2, background: alpha('#04202b', 0.8) }} />
-      ) : null}
+      {String(order).padStart(2, '0')}
     </div>
   );
 };
 
-// ───────────────────────── 左栏 HUD ─────────────────────────
+// ───────────────────────── 左栏信息面板 ─────────────────────────
 const HudPanel: React.FC<{
   title: string;
   subtitle: string;
@@ -177,9 +164,9 @@ const HudPanel: React.FC<{
     <div
       style={{
         position: 'absolute',
-        left: 88,
-        top: 96,
-        width: 396,
+        left: 84,
+        top: 92,
+        width: 408,
         fontFamily: SANS,
         opacity: inP,
         transform: `translateX(${(1 - inP) * -18}px)`,
@@ -195,59 +182,109 @@ const HudPanel: React.FC<{
         style={{
           marginTop: 14,
           height: 1,
-          width: done ? 396 : 396 * clamp01(0.18 + progress * 0.82),
+          width: done ? 408 : 408 * clamp01(0.18 + progress * 0.82),
           background: `linear-gradient(90deg, ${CYAN}, ${alpha(CYAN, 0.05)})`,
         }}
       />
 
-      <div style={{ marginTop: 26, fontSize: 42, fontWeight: 800, color: TEXT, letterSpacing: 1.5, lineHeight: 1.16 }}>
+      <div style={{ marginTop: 24, fontSize: 40, fontWeight: 800, color: TEXT, letterSpacing: 1.5, lineHeight: 1.16 }}>
         {title}
       </div>
-      <div style={{ marginTop: 12, fontSize: 19, color: DIM, lineHeight: 1.5, letterSpacing: 0.6 }}>{subtitle}</div>
+      {/* textWrap: balance 让两行长度均衡，避免出现只有一个字的孤行 */}
+      <div
+        style={
+          {
+            marginTop: 10,
+            fontSize: 18,
+            color: DIM,
+            lineHeight: 1.55,
+            letterSpacing: 0.4,
+            textWrap: 'balance',
+          } as React.CSSProperties
+        }
+      >
+        {subtitle}
+      </div>
 
-      <div style={{ marginTop: 34 }}>
+      <div style={{ marginTop: 30 }}>
         {targets.map(({ t, ft }, i) => {
           const lit = frame >= ft;
-          const p = ramp(frame, ft, 8);
+          const typedLen = Math.min(t.detail.length, Math.max(0, Math.floor((frame - ft - 3) * 1.8)));
+          const typing = lit && typedLen < t.detail.length;
           return (
-            <div key={t.head} style={{ display: 'flex', alignItems: 'center', height: 42 }}>
+            <div key={t.head} style={{ marginBottom: 20 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                <span
+                  style={{
+                    width: 22,
+                    height: 22,
+                    borderRadius: 3,
+                    background: lit ? CYAN : 'transparent',
+                    border: `1.5px solid ${lit ? CYAN : alpha(DIM, 0.45)}`,
+                    color: lit ? '#04202b' : alpha(DIM, 0.5),
+                    fontFamily: MONO,
+                    fontSize: 12,
+                    fontWeight: 800,
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    boxShadow: lit ? `0 0 12px ${alpha(CYAN, 0.5)}` : 'none',
+                  }}
+                >
+                  {String(i + 1).padStart(2, '0')}
+                </span>
+                <span
+                  style={{
+                    fontFamily: MONO,
+                    fontSize: 16,
+                    fontWeight: 700,
+                    letterSpacing: 2.5,
+                    color: lit ? CYAN : alpha(DIM, 0.45),
+                  }}
+                >
+                  {t.head}
+                </span>
+              </div>
               <div
                 style={{
-                  width: 8,
-                  height: 8,
-                  marginRight: 14,
-                  background: lit ? CYAN : 'transparent',
-                  border: `1.5px solid ${lit ? CYAN : alpha(DIM, 0.55)}`,
-                  boxShadow: lit ? `0 0 10px ${CYAN}` : 'none',
-                  transform: `rotate(${45}deg) scale(${0.85 + p * 0.15})`,
-                }}
-              />
-              <span
-                style={{
-                  fontSize: 19,
-                  fontFamily: SANS,
-                  color: lit ? TEXT : alpha(DIM, 0.55),
-                  letterSpacing: 0.5,
+                  marginLeft: 32,
+                  marginTop: 5,
+                  minHeight: 24,
+                  fontSize: 17,
+                  lineHeight: 1.38,
+                  color: lit ? TEXT : alpha(DIM, 0.4),
+                  letterSpacing: 0.3,
                 }}
               >
-                {t.detail}
-              </span>
-              <span
-                style={{
-                  marginLeft: 'auto',
-                  fontFamily: MONO,
-                  fontSize: 13,
-                  color: lit ? alpha(CYAN, 0.9) : alpha(DIM, 0.35),
-                }}
-              >
-                {String(i + 1).padStart(2, '0')}
-              </span>
+                {lit ? t.detail.slice(0, typedLen) : t.detail.replace(/[^\s]/g, ' ')}
+                {typing ? (
+                  <span style={{ display: 'inline-block', width: 2, height: 16, marginLeft: 2, background: CYAN, opacity: 0.8 }} />
+                ) : null}
+              </div>
             </div>
           );
         })}
       </div>
 
-      <div style={{ position: 'absolute', top: 640, width: 396 }}>
+      {/* 列表与状态行之间补一组竖向刻度：填掉中段空白，也让左栏读起来像一块仪表 */}
+      <div style={{ marginTop: 18, height: 150, position: 'relative' }}>
+        <div style={{ position: 'absolute', top: 0, left: 0, width: 1, height: 150, background: alpha(CYAN, 0.16) }} />
+        {Array.from({ length: 11 }, (_, i) => (
+          <div
+            key={i}
+            style={{
+              position: 'absolute',
+              top: i * 15,
+              left: 0,
+              width: i % 5 === 0 ? 26 : 12,
+              height: 1,
+              background: alpha(CYAN, i % 5 === 0 ? 0.34 : 0.14),
+            }}
+          />
+        ))}
+      </div>
+
+      <div style={{ position: 'absolute', top: 520, width: 408 }}>
         <div style={{ display: 'flex', alignItems: 'center', fontFamily: MONO, fontSize: 15, letterSpacing: 2 }}>
           <div
             style={{
@@ -264,7 +301,7 @@ const HudPanel: React.FC<{
             {String(firedCount).padStart(2, '0')} / {String(targets.length).padStart(2, '0')}
           </span>
         </div>
-        <div style={{ marginTop: 12, height: 4, width: 396, background: alpha(DIM, 0.16), borderRadius: 2, overflow: 'hidden' }}>
+        <div style={{ marginTop: 12, height: 4, width: 408, background: alpha(DIM, 0.16), borderRadius: 2, overflow: 'hidden' }}>
           <div style={{ width: `${(progress * 100).toFixed(2)}%`, height: '100%', background: CYAN, borderRadius: 2 }} />
         </div>
       </div>
@@ -298,7 +335,7 @@ export const ScanShot: React.FC<{
   const lineOn = ramp(frame, SCAN0 - 4, 5) * (1 - ramp(frame, lastFire + 8, 14));
 
   // 全程极缓推镜，让画面一直活着
-  const push = 1 + 0.06 * ramp(frame, 0, durationInFrames);
+  const push = 1 + 0.05 * ramp(frame, 0, durationInFrames);
   const done = frame >= lastFire + 10;
   const enter = ramp(frame, 0, 16);
 
@@ -325,8 +362,8 @@ export const ScanShot: React.FC<{
             position: 'absolute',
             inset: 0,
             transform: `scale(${push})`,
-            // 偏上取原点：推镜时几乎不裁窗口标题栏，多出来的裁切落在底部日志区
-            transformOrigin: '50% 18%',
+            // 原点压到最上：推镜几乎不动窗口标题栏，多出来的裁切落在底部日志区
+            transformOrigin: '50% 2%',
           }}
         >
           <Img src={staticFile(image)} style={{ width: '100%', height: '100%', objectFit: 'cover', display: 'block' }} />
@@ -401,11 +438,11 @@ export const ScanShot: React.FC<{
             </>
           ) : null}
 
-          {/* 取景框与标签（同处缩放层，跟随推镜） */}
-          {schedule.map(({ t, ft }) => (
+          {/* 取景框 + 编号徽章（同处缩放层，跟随推镜） */}
+          {schedule.map(({ t, ft }, i) => (
             <React.Fragment key={t.head}>
               <Bracket t={t} frame={frame} fired={ft} />
-              <Label t={t} frame={frame} fired={ft} />
+              <Badge t={t} frame={frame} fired={ft} order={i + 1} />
             </React.Fragment>
           ))}
         </div>
@@ -480,7 +517,7 @@ export const ScanShot: React.FC<{
           style={{
             position: 'absolute',
             left: 1706,
-            top: 168 + ((660 / 8) * i),
+            top: 168 + (660 / 8) * i,
             width: i % 4 === 0 ? 12 : 6,
             height: 1,
             background: alpha(CYAN, i % 4 === 0 ? 0.5 : 0.24),
