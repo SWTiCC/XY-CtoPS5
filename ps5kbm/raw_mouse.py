@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import threading
 from ctypes import wintypes
 
 _LOGGER = logging.getLogger(__name__)
@@ -151,6 +152,9 @@ class RawMouseReader:
         self._error: str | None = None
         self._wndproc_ref = None
         self._debug_count = 0
+        self._stat_lock = threading.Lock()
+        self._in_count = 0
+        self._in_motion = 0
         # 绝对坐标模式下的上一帧位置（远程桌面注入用）
         self._abs_last: tuple[int, int] | None = None
 
@@ -177,11 +181,22 @@ class RawMouseReader:
             return False
 
     def pump(self) -> None:
-        """排空消息队列；由主线程定时调用（非阻塞）。"""
+        """排空消息队列；由主线程定时调用（非阻塞）。
+
+        WM_INPUT 直接从消息里取 HRAWINPUT 处理，**不再让原生代码回调 Python**。
+        窗口过程改成系统自带的 DefWindowProc（见 `_create_window`），
+        所以 `DispatchMessageW` 里不会有任何 Python 代码执行——之前正是
+        「DispatchMessageW（会释放 GIL）里跑 Python 窗口过程」在实机上触发过
+        致命错误：PyEval_RestoreThread ... the current Python thread state is NULL。
+        消息仍然照常 Dispatch 一次，让系统完成 WM_INPUT 的缓冲区清理。
+        """
         if self._hwnd is None:
             return
         msg = wintypes.MSG()
         while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, _PM_REMOVE):
+            if msg.message == WM_INPUT:
+                # MSDN：lParam 才是 HRAWINPUT 句柄
+                self._handle_input(int(msg.lParam))
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -198,20 +213,23 @@ class RawMouseReader:
         hinstance = kernel32.GetModuleHandleW(None)
         class_name = "Ps5KbmRawMouseMain"
 
-        def wndproc(hwnd, msg, wparam, lparam):
-            if msg == WM_INPUT:
-                # MSDN：lParam 才是 HRAWINPUT 句柄
-                self._handle_input(lparam)
-                return 0
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        self._wndproc_ref = WNDPROC(wndproc)
+        # 窗口过程直接用系统自带的 DefWindowProc：这个窗口只用来接 WM_INPUT，
+        # 消息在 pump() 里从队列里直接取，不需要任何 Python 回调。
+        # 之前挂的是 ctypes 的 Python 窗口过程，等于让「原生 → Python 回调」
+        # 跑在 DispatchMessageW（会释放 GIL）内部，实机崩溃过一次：
+        #   Fatal Python error: PyEval_RestoreThread: ...
+        #   (the current Python thread state is NULL)
+        native_proc = ctypes.cast(user32.DefWindowProcW, WNDPROC)
+        self._wndproc_ref = native_proc
         wndclass = WNDCLASSW()
-        wndclass.lpfnWndProc = self._wndproc_ref
+        wndclass.lpfnWndProc = native_proc
         wndclass.hInstance = hinstance
         wndclass.lpszClassName = class_name
         if not user32.RegisterClassW(ctypes.byref(wndclass)):
-            raise OSError("RegisterClassW 失败")
+            # 1410 = 类已注册（断线重连后再次 setup 会走到这里，不是错误）
+            error = ctypes.get_last_error() or kernel32.GetLastError()
+            if error != 1410:
+                raise OSError(f"RegisterClassW 失败（{error}）")
         # 标准窗口样式 + 非零尺寸，但不显示
         ws_overlapped_window = 0x00CF0000
         hwnd = user32.CreateWindowExW(
@@ -298,4 +316,15 @@ class RawMouseReader:
             dx = x
             dy = y
         if dx or dy:
+            with self._stat_lock:
+                self._in_count += 1
+                self._in_motion += abs(dx) + abs(dy)
             self._on_delta(dx, dy)
+
+    def stats(self) -> tuple[int, int]:
+        """(WM_INPUT 消息数, 累计 |dx|+|dy|)，取走后清零；诊断用。"""
+        with self._stat_lock:
+            count, motion = self._in_count, self._in_motion
+            self._in_count = 0
+            self._in_motion = 0
+            return count, motion

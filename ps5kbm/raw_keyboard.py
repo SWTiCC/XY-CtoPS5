@@ -217,24 +217,21 @@ class RawKeyboardReader(threading.Thread):
         hinstance = kernel32.GetModuleHandleW(None)
         class_name = "Ps5KbmRawKeyboard"
 
-        def wndproc(hwnd, msg, wparam, lparam):
-            if msg == WM_INPUT:
-                # MSDN: lParam 是 HRAWINPUT 句柄（wParam 只是 RIM_INPUT/
-                # RIM_INPUTSINK 标识），GetRawInputData 必须用 lParam。
-                self._handle_input(lparam)
-                return 0
-            if msg == WM_CLOSE:
-                user32.DestroyWindow(hwnd)
-                return 0
-            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
-
-        self._wndproc_ref = WNDPROC(wndproc)
+        # 窗口过程用系统自带的 DefWindowProc（理由同 raw_mouse）：WM_INPUT 在
+        # 消息循环里直接从 lParam 取，绝不让「原生 → Python 回调」跑在
+        # DispatchMessageW（会释放 GIL）内部——那会触发致命错误
+        # PyEval_RestoreThread ... the current Python thread state is NULL。
+        native_proc = ctypes.cast(user32.DefWindowProcW, WNDPROC)
+        self._wndproc_ref = native_proc
         wndclass = WNDCLASSW()
-        wndclass.lpfnWndProc = self._wndproc_ref
+        wndclass.lpfnWndProc = native_proc
         wndclass.hInstance = hinstance
         wndclass.lpszClassName = class_name
         if not user32.RegisterClassW(ctypes.byref(wndclass)):
-            raise OSError("RegisterClassW 失败")
+            # 1410 = 类已注册（重连后再次创建窗口时正常出现）
+            error = ctypes.get_last_error() or kernel32.GetLastError()
+            if error != 1410:
+                raise OSError(f"RegisterClassW 失败（{error}）")
         # 必须给标准窗口样式和非零尺寸：style=0 + 0x0 的窗口在部分系统上
         # 不被视为有效顶层窗口，Raw Input 不会投递 WM_INPUT。
         ws_overlapped_window = 0x00CF0000
@@ -273,6 +270,10 @@ class RawKeyboardReader(threading.Thread):
             result = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if result in (0, -1):
                 break
+            if msg.message == WM_INPUT:
+                # MSDN: lParam 是 HRAWINPUT 句柄（wParam 只是 RIM_INPUT/
+                # RIM_INPUTSINK 标识），GetRawInputData 必须用 lParam。
+                self._handle_input(int(msg.lParam))
             user32.TranslateMessage(ctypes.byref(msg))
             user32.DispatchMessageW(ctypes.byref(msg))
 

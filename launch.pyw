@@ -55,14 +55,40 @@ def _report(exc: BaseException) -> None:
         pass
 
 
+def _enable_faulthandler() -> None:
+    """把致命错误（GIL/段错误这类异常抓不到的）也写进文件。
+
+    打包成无控制台的 exe 后，致命错误只会打到 stderr（可能是 None），
+    排查时什么也看不到；这里固定写一份 faulthandler.log。
+    """
+    global _FAULT_HANDLE
+    if _FAULT_HANDLE is not None:
+        return
+    try:
+        import faulthandler
+
+        _FAULT_HANDLE = open(
+            os.path.join(_log_dir(), "faulthandler.log"),
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        faulthandler.enable(file=_FAULT_HANDLE, all_threads=True)
+    except Exception:  # noqa: BLE001 - 抓不到致命错误也不影响启动
+        _FAULT_HANDLE = None
+
+
 def main() -> int:
     from ps5kbm.app import main as app_main
 
     return app_main()
 
 
+_FAULT_HANDLE = None
+
 if __name__ == "__main__":
     _ensure_streams()
+    _enable_faulthandler()
     try:
         raise SystemExit(main())
     except SystemExit:

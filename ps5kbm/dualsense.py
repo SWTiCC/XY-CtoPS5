@@ -7,12 +7,15 @@
 - 蓝牙：报告 0x31，78 字节，状态从第 2 字节开始（所以下面统一用 `_OFFSET + n`）。
 
 输出报告（写手柄，USB 报告 0x02）：
-- byte 1：valid_flag0，bit0 = 兼容震动（COMPATIBLE_VIBRATION）；
-- byte 2：valid_flag1（灯条/麦克风 LED 等，这里不用）；
+- byte 1：valid_flag0，bit0|bit1 = 经典马达，bit2 = 右扳机，bit3 = 左扳机；
+- byte 2：valid_flag1，bit2 = 灯条，bit4 = 玩家指示灯，bit6 = 效果总功率；
 - byte 3：右马达（弱/高频）；byte 4：左马达（强/低频）；
-- byte 11..21：右扳机效果块；22..32：左扳机效果块（各 11 字节，自适应扳机用）。
-  偏移来自 Linux 内核 `hid-playstation.c` 的 `dualsense_output_report_common`；
-  扳机效果的使能位还没有真机验证，见 docs/plans/2026-11-24-controller-page.md。
+- byte 11..21：右扳机效果块；22..32：左扳机效果块（各 11 字节：模式 + 10 参数）。
+- byte 39：ledOption（0x03 = 玩家灯亮度由本包控制 + 不被固件打断）；
+  byte 43：玩家灯亮度；byte 44：玩家灯编号；byte 45..47：灯条 RGB。
+
+偏移以 pydualsense 0.7.5 与 SDL 的 DualSense 实现为准（两者一致），
+扳机/灯条/马达都已在实机验证过。
 
 线程模型：一个后台线程负责连接/读取，界面与主循环只拿快照；
 写操作（震动/扳机效果）加锁，失败只记错误，不影响主流程。
@@ -66,6 +69,23 @@ _BT_LEFT_TRIGGER = 23
 # valid_flag0 的位：经典马达要 0x01+0x02 一起置位；扳机效果左 0x04 / 右 0x08 对应
 # pydualsense 注释里的 “0x04 set the right trigger motor / 0x08 set the left trigger motor”
 _VALID0_MOTORS = 0x01 | 0x02
+# 灯条 / 玩家灯偏移（pydualsense 0.7.5 的输出报告布局；蓝牙整体后移 1 字节）
+_USB_LED_OPTION = 39
+_USB_LED_BRIGHTNESS = 43
+_USB_PLAYER_LEDS = 44
+_USB_LIGHTBAR = 45
+_BT_LED_OPTION = 40
+_BT_LED_BRIGHTNESS = 44
+_BT_PLAYER_LEDS = 45
+_BT_LIGHTBAR = 46
+# valid_flag1：0x04 = 灯条，0x10 = 玩家指示灯
+_VALID1_LIGHTBAR = 0x04
+_VALID1_PLAYER_LEDS = 0x10
+# ledOption：0x01 玩家灯亮度由本包控制，0x02 不被打断
+_LED_OPTION_BOTH = 0x03
+# 玩家灯编号（PlayerID 枚举：1~4 号，0 表示全亮）
+PLAYER_LED_VALUES = {0: 31, 1: 4, 2: 10, 3: 21, 4: 27}
+
 _VALID0_RIGHT_TRIGGER = 0x04
 _VALID0_LEFT_TRIGGER = 0x08
 
@@ -413,11 +433,15 @@ def list_devices() -> list[DeviceInfo]:
     return result
 
 
-class DualSenseReader(threading.Thread):
-    """后台线程：连接手柄、持续读报告、提供快照与输出（震动/扳机效果）。"""
+class DualSenseReader:
+    """后台线程：连接手柄、持续读报告、提供快照与输出（震动/扳机效果）。
+
+    内部持有线程对象而不是自己继承 Thread：玩法隔离要求「切走手柄玩法时把读取线程
+    停掉、HID 句柄关掉，切回来再起」，而 Thread 对象不能重复 start()。
+    """
 
     def __init__(self) -> None:
-        super().__init__(daemon=True, name="dualsense")
+        self._thread: threading.Thread | None = None
         self._lock = threading.RLock()
         self._state: ControllerState | None = None
         self._device = None
@@ -425,25 +449,42 @@ class DualSenseReader(threading.Thread):
         self._running = False
         self._error = ""
         self._last_report = 0.0
+        self._motors = (0, 0)  # (left, right) 最近一次写入的马达值
         # 输出报告可能从反馈线程写、读线程读，hidapi 的句柄不能并发用
         self._write_lock = threading.Lock()
         # 输出报告按连接方式（USB 0x02 / 蓝牙 0x31）选布局，收到第一帧后确定
         self._transport = "usb"
+        self._haptics_mode = False  # True = 走 USB 音频触觉，不再发经典马达
 
     # ------------------------------------------------------------ 生命周期
     def start_reader(self) -> None:
-        if self.is_alive():
-            return
-        self._running = True
-        self.start()
+        """启动读取线程；已在跑则什么都不做，stop() 之后可以再次启动。"""
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._running = True
+            thread = threading.Thread(
+                target=self._run_loop, daemon=True, name="dualsense"
+            )
+            self._thread = thread
+        thread.start()
 
     def stop(self) -> None:
-        self._running = False
-        if self.is_alive():
-            self.join(timeout=1.0)
+        """停线程并关 HID 句柄（完全释放；下次 start_reader 会重新开）。"""
+        with self._lock:
+            self._running = False
+            thread = self._thread
+            self._thread = None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=1.0)
         self._close()
 
-    def run(self) -> None:
+    def is_alive(self) -> bool:
+        with self._lock:
+            thread = self._thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _run_loop(self) -> None:
         while self._running:
             if self._device is None:
                 if not self._try_open():
@@ -500,9 +541,14 @@ class DualSenseReader(threading.Thread):
 
     # ------------------------------------------------------------ 输出
     def _new_output_report(self) -> tuple[bytearray, dict]:
-        """按当前连接方式准备输出报告，返回 (报告, 字段偏移表)。"""
+        """按当前连接方式准备输出报告，返回 (报告, 字段偏移表)。
+
+        和 pydualsense 一致：每份报告都带上马达字段（valid0 置 0x01|0x02 并写当前值），
+        否则只改扳机/灯条的报告会让手柄把马达状态当成未指定而提前停下。
+        """
         with self._lock:
             transport = self._transport
+            motors = self._motors
         if transport == "bt":
             report = bytearray(BT_OUTPUT_LENGTH)
             report[0] = BT_OUTPUT_REPORT_ID
@@ -511,10 +557,22 @@ class DualSenseReader(threading.Thread):
                 "valid0": _BT_VALID0,
                 "valid1": _BT_VALID1,
                 "intensity": 38,
+                "led_option": _BT_LED_OPTION,
+                "led_brightness": _BT_LED_BRIGHTNESS,
+                "player_leds": _BT_PLAYER_LEDS,
+                "lightbar": _BT_LIGHTBAR,
                 "motor_right": _BT_MOTOR_RIGHT,
                 "motor_left": _BT_MOTOR_LEFT,
                 "right_trigger": _BT_RIGHT_TRIGGER,
                 "left_trigger": _BT_LEFT_TRIGGER,
+                # 音频/触觉相关（USB 偏移 +1）
+                "volume_headphone": 6,
+                "volume_speaker": 7,
+                "volume_mic": 8,
+                "audio_control1": 9,
+                "mute_light_mode": 10,
+                "power_save_mute": 11,
+                "haptic_lowpass": 41,
             }
         else:
             report = bytearray(USB_OUTPUT_LENGTH)
@@ -523,45 +581,166 @@ class DualSenseReader(threading.Thread):
                 "valid0": _USB_VALID0,
                 "valid1": _USB_VALID1,
                 "intensity": 37,
+                "led_option": _USB_LED_OPTION,
+                "led_brightness": _USB_LED_BRIGHTNESS,
+                "player_leds": _USB_PLAYER_LEDS,
+                "lightbar": _USB_LIGHTBAR,
                 "motor_right": _USB_MOTOR_RIGHT,
                 "motor_left": _USB_MOTOR_LEFT,
                 "right_trigger": _USB_RIGHT_TRIGGER,
                 "left_trigger": _USB_LEFT_TRIGGER,
+                # 音频/触觉相关（dualsense-controller 的 output.rs 字节表）
+                "volume_headphone": 5,
+                "volume_speaker": 6,
+                "volume_mic": 7,
+                "audio_control1": 8,
+                "mute_light_mode": 9,
+                "power_save_mute": 10,
+                "haptic_lowpass": 40,
             }
+        # 触觉模式下不能带马达使能位：USB 音频触觉和经典马达是互斥的两条路，
+        # 只要报告里置了 0x01|0x02，手柄就会切到「兼容震动」，音频触觉随即静音。
+        if not self._haptics_mode:
+            report[layout["valid0"]] |= _VALID0_MOTORS
+            report[layout["motor_left"]] = motors[0]
+            report[layout["motor_right"]] = motors[1]
         return report, layout
 
-    def rumble(self, low: float, high: float) -> bool:
-        """震动：low=强/低频马达，high=弱/高频马达，0..1。"""
+    def set_haptics_mode(self, enabled: bool) -> None:
+        """USB 原生触觉启用时，关掉经典马达通道（两者互斥，见 _new_output_report）。
+
+        进入触觉模式时顺带补发一帧「打开音频通路」——这样键鼠玩法下完全不碰手柄，
+        只有真的要用触觉时才写这几帧（音量/静音位）。
+        """
+        with self._lock:
+            if self._haptics_mode == enabled:
+                return
+            self._haptics_mode = enabled
+            transport = self._transport
+        _LOGGER.info("手柄输出模式：%s", "音频触觉（不发经典马达）" if enabled else "经典马达")
+        if enabled and transport == "usb":
+            self.unlock_audio()
+
+    @property
+    def haptics_mode(self) -> bool:
+        with self._lock:
+            return self._haptics_mode
+
+    def rumble(self, low: float, high: float, force: bool = False) -> bool:
+        """震动：low=强/低频马达，high=弱/高频马达，0..1。
+
+        触觉模式下默认不发（会静音音频触觉）；`force=True` 用于「试震动」按钮，
+        写完由调用方重新发一帧 unlock_audio() 把音频触觉恢复回来。
+        """
+        if self._haptics_mode and not force:
+            return False
         low_byte = max(0, min(255, int(round(float(low) * 255))))
         high_byte = max(0, min(255, int(round(float(high) * 255))))
         report, layout = self._new_output_report()
         report[layout["valid0"]] |= _VALID0_MOTORS
         report[layout["motor_right"]] = high_byte
         report[layout["motor_left"]] = low_byte
+        with self._lock:
+            self._motors = (low_byte, high_byte)
+        return self._write(report)
+
+    def set_lightbar(self, rgb: bytes, player: int | None = None) -> bool:
+        """把主机下发的灯条颜色写到手柄（可选同时设置玩家灯编号）。
+
+        协议细节来自 pydualsense：valid_flag1 的 0x04 表示本包改灯条、
+        0x10 表示本包改玩家指示灯；ledOption 置 0x03（不被打断），
+        灯条 RGB 在 USB 的 [45:48] / 蓝牙的 [46:49]。
+        """
+        if len(rgb) != 3:
+            return False
+        report, layout = self._new_output_report()
+        report[layout["valid1"]] |= _VALID1_LIGHTBAR
+        report[layout["led_option"]] = _LED_OPTION_BOTH
+        report[layout["led_brightness"]] = 0x00
+        block = layout["lightbar"]
+        report[block : block + 3] = rgb
+        if player is not None:
+            value = PLAYER_LED_VALUES.get(int(player))
+            if value is not None:
+                report[layout["valid1"]] |= _VALID1_PLAYER_LEDS
+                report[layout["player_leds"]] = value
+        return self._write(report)
+
+    def set_trigger_effects(
+        self, left: bytes | None = None, right: bytes | None = None
+    ) -> bool:
+        """一次写左右两边的扳机效果（各 11 字节：模式 + 参数）。
+
+        照 chiaki / Veyra 的做法：一份报告里同时置左右两个有效位
+        （0x04 | 0x08 = 0x0C）并同时写入两块数据。
+        之前分两次写，后一次会把前一份报告整体覆盖掉，只有最后一侧生效，
+        这也是「L2 松手偶尔不生效」「效果时有时无」的来源。
+        传 None 的一侧写入「关闭」效果（0x05），不会留下上一条残留。
+        """
+        if (left is not None and len(left) != 11) or (
+            right is not None and len(right) != 11
+        ):
+            return False
+        report, layout = self._new_output_report()
+        report[layout["valid0"]] |= _VALID0_LEFT_TRIGGER | _VALID0_RIGHT_TRIGGER
+        # chiaki 的做法：同时置效果功率位（0x40）并给强度字节
+        report[layout["valid1"]] |= 0x40
+        report[layout["intensity"]] = 0x00
+        off = trigger_effect_off()
+        left_block = layout["left_trigger"]
+        right_block = layout["right_trigger"]
+        report[left_block : left_block + 11] = left if left is not None else off
+        report[right_block : right_block + 11] = right if right is not None else off
         return self._write(report)
 
     def set_trigger_effect(self, side: str, effect: bytes) -> bool:
-        """写自适应扳机效果块（11 字节：模式 + 参数）。
-
-        效果字节由 `trigger_effect_*` / `effect_bytes` 生成；
-        主机下发的效果怎么解包还没验证（计划 S4），这里先把写入通道打通。
-        """
-        if len(effect) != 11:
-            return False
+        """只改一侧的扳机效果（本地试效果用），另一侧保持关闭。"""
         right = side.lower() in ("r", "right", "r2")
-        report, layout = self._new_output_report()
-        report[layout["valid0"]] |= _VALID0_RIGHT_TRIGGER if right else _VALID0_LEFT_TRIGGER
-        # chiaki 的做法：同时置效果功率位（0x40）并给强度字节，
-        # 否则部分游戏的效果（比如油门/刹车阻尼）不生效
-        report[layout["valid1"]] |= 0x40
-        report[layout["intensity"]] = 0x00
-        block = layout["right_trigger"] if right else layout["left_trigger"]
-        report[block : block + 11] = effect
-        return self._write(report)
+        if right:
+            return self.set_trigger_effects(right=effect)
+        return self.set_trigger_effects(left=effect)
 
-    def clear_trigger_effect(self, side: str) -> bool:
-        """把某一边的扳机效果关掉。"""
+    def clear_trigger_effect(self, side: str | None = None) -> bool:
+        """关掉扳机效果；不传 side 时两边一起关。"""
+        if side is None:
+            return self.set_trigger_effects()
         return self.set_trigger_effect(side, trigger_effect_off())
+
+    def unlock_audio(self) -> bool:
+        """打开手柄的音频/触觉通路（扬声器音量 + 清静音与省电位）。
+
+        为什么必须有这一步：接在 PC 上时手柄内部这两个寄存器是「音量 0 / 静音」状态，
+        Windows 把音频送到那个四声道端点后，手柄照样不出声、触觉执行器也不动
+        （实机现象：端点峰值 0.98，手柄毫无反应）。PS5 和 SDL 都会替手柄设一遍。
+
+        字节定义来自 dualsense-controller 的 output.rs：
+          report[10] power_save_mute_control：
+            0x04 POWER_SAVE_HAPTIC / 0x08 POWER_SAVE_AUDIO
+            0x20 MUTE_SPEAKER / 0x80 MUTE_HAPTIC
+          report[6] volume_speaker（PS5 约 0x5D~0x64）
+        valid_flag0 的 0x10/0x20/0x40/0x80 分别允许耳机/扬声器/麦克风音量与音频控制组1，
+        valid_flag1 的 0x02 允许音频静音位生效。
+
+        注意：这一帧**不带马达使能位**（valid0 只写 0xF0），避免顺手把触觉切走。
+        """
+        report, layout = self._new_output_report()
+        report[layout["valid0"]] = 0x10 | 0x20 | 0x40 | 0x80
+        report[layout["valid1"]] |= 0x02 | 0x20
+        report[layout["motor_left"]] = 0
+        report[layout["motor_right"]] = 0
+        report[layout["volume_headphone"]] = 0x64
+        report[layout["volume_speaker"]] = 0x64
+        report[layout["volume_mic"]] = 0x64
+        report[layout["audio_control1"]] = 0x0C  # 回声/降噪默认值
+        report[layout["mute_light_mode"]] = 0x00
+        report[layout["power_save_mute"]] = 0x00  # 清空所有静音 / 省电位
+        report[layout["haptic_lowpass"]] = 0x00
+        ok = self._write(report)
+        if ok:
+            _LOGGER.info("已打开手柄音频通路（扬声器音量 100%、清静音与省电位）")
+        else:
+            _LOGGER.warning("打开手柄音频通路失败")
+        return ok
 
     # ------------------------------------------------------------ 内部实现
     def _try_open(self) -> bool:
@@ -620,6 +799,8 @@ class DualSenseReader(threading.Thread):
             self._device = None
             self._info = None
             self._state = None
+            # 重连后要重新进入触觉模式（重新发解锁帧），所以这里复位
+            self._haptics_mode = False
         if device is not None:
             try:
                 device.close()

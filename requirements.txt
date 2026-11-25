@@ -17,18 +17,8 @@ cffi
 pynput
 psutil
 customtkinter
-# 读 DualSense（陀螺仪/按键/震动/自适应扳机）：PyPI 包名 hidapi
-# USB 原生触觉：Opus 解码 + DualSense 4 声道音频输出
-av>=12
-numpy
-sounddevice，
-# 导入名是 hid（Cython 版，已静态链接 hidapi
-# USB 原生触觉：Opus 解码 + DualSense 4 声道音频输出
-av>=12
-numpy
-sounddevice，不需要额外 dll）
+# 读 DualSense（陀螺仪/按键/震动/自适应扳机）：PyPI 包名 hidapi，导入名是 hid
 hidapi
-# USB 原生触觉：Opus 解码 + DualSense 4 声道音频输出
-av>=12
+# USB 原生触觉：DualSense 四声道音频输出（触觉包是原始 3kHz PCM，不需要解码）
 numpy
 sounddevice

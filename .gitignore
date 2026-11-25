@@ -42,3 +42,7 @@ tests/_tmp/
 
 # 宣传视频工程（本地保留，不上传）
 video/
+
+# 运行时诊断日志
+faulthandler.log
+stdout.log

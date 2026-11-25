@@ -36,6 +36,7 @@ from . import (
     probe,
     run_tuning_ui,
     run_ui,
+    trigger_filter,
     ui_pages,
     windows,
 )
@@ -95,6 +96,8 @@ class Ps5KbmApp:
         self._tick_task = None
         self._running = False
         self._devices: list[dict] = []
+        # 键鼠侧输入层：只在键鼠玩法下存在；手柄玩法恒为 None（见「玩法隔离」一节）
+        self._source: InputSource | None = None
         self._source_ready = False
         self._page_name = "connect"
         self._logged_keys: set[str] = set()
@@ -124,35 +127,78 @@ class Ps5KbmApp:
         # 主机下发的反馈：手柄页上的开关控制是否转发
         self._last_console_rumble = 0.0
         self._last_trigger_blocks: dict[str, bytes] = {}
-        self._trigger_effect_time: dict[str, float] = {"l": 0.0, "r": 0.0}
-        self._trigger_pressed: dict[str, bool] = {"l2": False, "r2": False}
+        self._haptic_tone_chunks: list[bytes] = []
+        self._trigger_filter = trigger_filter.TriggerFilter()
+        self._last_lightbar = b""
+        # 触觉端点必须唯一才能路由（分不清是哪只的音频端点）
+        self._haptics_pad_count = 0
+        self._haptics_multi_logged = False
+        # 触觉输出能力只探测/记录一次
+        self._haptics_env_logged = False
+        # 玩法隔离状态只在启动时写一条 INFO
+        self._lifecycle_logged = False
+        # 触觉流诊断计数（默认只在异常时写 INFO，常态走 DEBUG，避免刷屏）
+        self._haptics_rx = 0
+        self._haptics_tx = 0
+        self._haptics_peak = 0
+        self._haptics_last_size = 0
+        self._haptics_stats_at = 0.0
+        self._haptics_underruns_prev = 0
+        # 扳机效果类型统计（仅 DEBUG：排查「主机有没有下发某类效果」时用）
+        self._trigger_mode_counts: dict[int, int] = {}
+        self._trigger_stats_at = 0.0
         bridge.set_feedback_handlers(
             self._on_console_rumble,
             self._on_console_trigger_effect,
             None,
+            self._on_console_led,
         )
         bridge.set_haptics_pcm_handler(self._on_haptics_pcm)
-        # 手柄页轮询定时器 id（关窗时取消）
+        # 手柄页轮询定时器 id（关窗时取消）；键鼠玩法下不跑
         self._poll_job: str | None = None
+        # Raw Input 消息泵定时器 id；手柄玩法下不跑
+        self._pump_job: str | None = None
 
         self._build_ui()
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        # Raw Input 窗口消息由主线程排空（子线程收不到 WM_INPUT）。
-        # 间隔 8ms：消息泵本身约 10ms 一批，再密只是空转 Tk 定时器。
-        self.root.after(8, self._pump_raw_messages)
-        # 手柄后台读取 + 页面状态轮询
-        self._controller.start_reader()
-        self._poll_job = self.root.after(120, self._poll_controller)
+        # 玩法隔离：只把当前玩法那一侧建起来。键鼠玩法不实例化手柄读取线程/触觉端点，
+        # 手柄玩法不实例化键鼠监听/钩子/全局热键/Raw Input 窗口。
+        self._sync_input_lifecycle()
 
     def _pump_raw_messages(self) -> None:
-        """主线程定时排空 Raw Input 窗口消息（非阻塞）。"""
+        """主线程定时排空 Raw Input 窗口消息（非阻塞）。
+
+        手柄玩法下不存在 Raw Input 窗口，这里也不再自我续期——省掉每秒 125 次空转。
+        """
+        self._pump_job = None
+        source = self._source
+        if source is None or not self._source_ready or self._controller_mode():
+            return
         try:
-            if self._source is not None:
-                self._source.pump_mouse_messages()
+            source.pump_mouse_messages()
         except Exception:  # noqa: BLE001 - 消息泵异常不能中断 UI
             pass
-        self.root.after(8, self._pump_raw_messages)
+        # 间隔 8ms：消息泵本身约 10ms 一批，再密只是空转 Tk 定时器
+        self._pump_job = self.root.after(8, self._pump_raw_messages)
+
+    def _ensure_pump_loop(self) -> None:
+        """确保 Raw Input 消息泵在跑（只有键鼠侧已启动、有 Raw Input 窗口时才需要）。"""
+        if self._pump_job is not None or self._source is None:
+            return
+        if not self._source_ready or self._controller_mode():
+            return
+        self._pump_job = self.root.after(8, self._pump_raw_messages)
+
+    def _stop_pump_loop(self) -> None:
+        """停掉 Raw Input 消息泵（手柄玩法 / 断开 / 关窗）。"""
+        job = self._pump_job
+        self._pump_job = None
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # noqa: BLE001 - 关窗时 Tk 可能已经销毁
+                pass
 
     # ------------------------------------------------------------ 初始化
     def _state_vars(self) -> None:
@@ -225,13 +271,9 @@ class Ps5KbmApp:
         self._mapper = InputMapper(self._config)
         self._mapper.set_left_value(self._config.left_stick.value)
         self._edit_mode = self._config.current_mode
-        self._source = InputSource(self._mapper, hotkey=self._config.hotkey)
-        self._source.set_capture_callback(self._on_capture_changed)
-        self._source.set_key_callback(self._on_key_event)
-        self._source.set_mode_switch(self._config.mode_switch, self._on_mode_switch)
-        self._source.set_trigger_adjust(
-            config.trigger_adjust_keys(self._config), self._on_adjust
-        )
+        # 键鼠侧对象不在这里建：由 _sync_input_lifecycle 按当前玩法决定要不要实例化，
+        # 手柄玩法下这台机器上不该存在任何键鼠监听对象。
+        self._source = None
         self._source_ready = False
         return self._config
 
@@ -361,7 +403,8 @@ class Ps5KbmApp:
                 )
                 return
             self._config.mode_switch = name
-            self._source.set_mode_switch(name, self._on_mode_switch)
+            if self._source is not None:
+                self._source.set_mode_switch(name, self._on_mode_switch)
             self._refresh_mode_ui()
             self._persist()
             self._append_log(f"模式切换键已设为：{display_key(name)}")
@@ -481,19 +524,45 @@ class Ps5KbmApp:
         self._run_subtitle.configure(text=subtitle)
 
     def _apply_capture_state(self, capturing: bool) -> None:
+        source = self._source
+        if self._controller_mode() or source is None:
+            # 手柄玩法 / 键鼠侧还没建起来：这里根本不存在"捕获"这回事。
+            # 旧代码在这里无条件 set_capturing(False) + release_cursor()，
+            # 手柄玩法下 _source 为 None 会直接 AttributeError。
+            if source is not None:
+                source.set_capturing(False)
+                source.release_cursor()
+            self._overlay.hide()
+            self._capture_button.configure(text="开始捕获")
+            if self._controller_mode():
+                # 手柄玩法不需要"捕获"：手柄输入一直在转发，键鼠/光标必须保持可用，
+                # 否则会锁光标 + 吞键盘 + 铺透明层，等于把电脑的鼠标键盘抢走。
+                self._input_state_label.configure(text="输入：手柄直通（键鼠不受影响）")
+                if self._bridge is not None:
+                    self._set_pill(f"手柄直通 · {self._bridge.host}", T.OK)
+                    self._set_run_state("手柄直通", "手柄输入已接管；键鼠照常可用")
+                return
+            self._input_state_label.configure(text="输入：未捕获")
+            if self._bridge is not None:
+                self._set_pill(f"已连接 · {self._bridge.host}", T.OK)
+                self._set_run_state("已连接", "点「开始捕获」把键鼠交给 PS5")
+            else:
+                self._set_pill("未连接", T.TEXT_FAINT)
+                self._set_run_state("未连接主机", "先到「连接」页建立会话，再回到这里开始捕获")
+            return
         if capturing and self._bridge is None:
             # 没有会话时不允许进捕获：F8 在断开后仍可能被按到，必须挡住，
             # 否则会铺一层全屏透明层 + 藏鼠标，却没有地方发送输入。
-            self._source.set_capturing(False)
+            source.set_capturing(False)
             self._append_log("还没有连接主机，先到「连接」页建立会话")
             return
         # 界面状态是唯一事实来源：不管从哪条路径进来，输入层都对齐到这里
-        self._source.set_capturing(capturing)
+        source.set_capturing(capturing)
         self._capture_button.configure(text="停止捕获" if capturing else "开始捕获")
         self._trace(f"capture = {capturing}")
         if capturing:
             self._logged_keys.clear()
-            self._source.lock_cursor()
+            source.lock_cursor()
             self._overlay.set_grab_focus(not bool(self._config.target_window))
             self._overlay.set_mode_text(self._mode_label(self._mapper.mode))
             self._overlay.show()
@@ -502,17 +571,15 @@ class Ps5KbmApp:
                 self.root.after(150, self._activate_target_window)
             self._set_pill("捕获中", T.CAPTURE)
             self._set_run_state("捕获中", "键鼠已接管：F8 或按钮可停止", T.CAPTURE)
-            listening = "监听正常" if self._source.listening else "监听异常"
+            listening = "监听正常" if source.listening else "监听异常"
             mouse_mode = (
-                "鼠标已拦截"
-                if self._source.full_capture
-                else "鼠标降级（锁光标读位移）"
+                "鼠标已拦截" if source.full_capture else "鼠标降级（锁光标读位移）"
             )
             self._input_state_label.configure(
                 text=f"输入：捕获中 | {listening} | {mouse_mode} | 按 WASD 看这里"
             )
         else:
-            self._source.release_cursor()
+            source.release_cursor()
             self._overlay.hide()
             self._input_state_label.configure(text="输入：未捕获")
             if self._bridge is not None:
@@ -523,7 +590,10 @@ class Ps5KbmApp:
                 self._set_run_state("未连接主机", "先到「连接」页建立会话，再回到这里开始捕获")
 
     def _apply_key_state(self, name: str) -> None:
-        listening = "监听正常" if self._source.listening else "监听异常"
+        source = self._source
+        if source is None:
+            return
+        listening = "监听正常" if source.listening else "监听异常"
         self._input_state_label.configure(
             text=f"输入：捕获中 | {listening} | 最近按键 {name.upper()}"
         )
@@ -847,9 +917,9 @@ class Ps5KbmApp:
         connect_ui.render(self)
         # 连上了才显示对应的页签（键鼠：映射/运行；手柄：手柄）
         self._update_nav()
-        if not self._source_ready:
-            self._source.start()
-            self._source_ready = True
+        # 玩法隔离：按当前玩法把对应那一侧拉起来（键鼠：装监听/钩子/热键；手柄：起读取线程），
+        # 另一侧这时一定不存在，再由这里兜一次
+        self._sync_input_lifecycle()
         self._running = True
         self._tick_task = asyncio.run_coroutine_threadsafe(self._tick_loop(), self._loop)
         self._append_log("输入通道就绪，按 F8 或点按钮开始捕获")
@@ -857,24 +927,26 @@ class Ps5KbmApp:
     def _disconnect(self) -> None:
         ps5 = self._bridge
         self._running = False
-        self._bridge = None
-        self._connecting = False
-        self._connect_error = ""
         self._stop_tick_loop()
+        # 照参考实现 releaseEffects()：会话结束时把马达、扳机效果和触觉一起放掉，
+        # 否则断开后扳机还是硬的、马达还在转、音频端点还占着
+        self._release_controller_effects()
         # 会话没了，手柄发出去的状态也不用再补发释放包，直接清空本地记录
         self._pending_controller_release = False
         self._controller_buttons_sent.clear()
         self._last_trigger_sent.clear()
-        self._last_trigger_blocks.clear()
+        self._trigger_filter.reset()
+        # 灯条记录也清掉：下次连上第一帧 pad_info 才会重新写颜色
+        self._last_lightbar = b""
         self._usb_haptics.close()
+        self._haptic_tone_chunks.clear()
         self._gyro_axis.reset()
-        if self._source.capturing:
-            self._source.toggle_capture()
-        if self._source_ready:
-            # 监听一起停掉：否则 F8 全局热键还挂着，断开后按下去会进一个
-            # 没有会话的捕获态（覆盖层铺满屏幕、鼠标被藏起来）。
-            self._source.stop()
-            self._source_ready = False
+        # 键鼠侧整套停掉（解钩子/热键/监听、销毁 Raw Input 窗口、松键、藏覆盖层）。
+        # 放在 _bridge 置空前：捕获中按住的键还能补一包释放给主机。
+        self._release_keyboard_side()
+        self._bridge = None
+        self._connecting = False
+        self._connect_error = ""
         self._apply_capture_state(False)
         self._set_run_state("会话已断开", "回「连接」页重新连接")
         self._capture_button.configure(state="disabled")
@@ -916,6 +988,10 @@ class Ps5KbmApp:
         last_send = 0.0
         last_left = (0.0, 0.0)
         last_key_sync = 0.0
+        mouse_frames = 0
+        mouse_motion = 0
+        mouse_peak = 0.0
+        last_mouse_log = 0.0
         while self._running:
             await asyncio.sleep(TICK_SECONDS)
             now = time.perf_counter()
@@ -949,21 +1025,53 @@ class Ps5KbmApp:
                         )
                     was_capturing = False
                     continue
-                if self._source.capturing:
+                source = self._source
+                if source is None:
+                    # 键鼠侧不存在（刚切到别的玩法 / 还没建起来）：本帧不转发键鼠输入
+                    was_capturing = False
+                    continue
+                if source.capturing:
                     # 只调用 poll：它读位移后会把光标拉回中心。
-                    dx, dy = self._source.poll_mouse_delta()
+                    dx, dy = source.poll_mouse_delta()
                     # 无条件喂（含 0）：滑动平均需要每帧一个样本
                     self._mapper.on_mouse_delta(dx, dy)
+                    if dx or dy:
+                        mouse_frames += 1
+                        mouse_motion += abs(dx) + abs(dy)
                     # 每 0.5 秒校正一次按键状态：多路监听偶尔会丢 keyup，
                     # 残留的键会让左摇杆方向错乱（按 A 却向右走）
                     if now - last_key_sync >= 0.5:
                         last_key_sync = now
-                        self._mapper.drop_missing(self._source.pressed_keys())
+                        self._mapper.drop_missing(source.pressed_keys())
                 elif was_capturing:
-                    self._source.release_cursor()
+                    source.release_cursor()
                     self._bridge.send_events(self._mapper.release_all())
-                was_capturing = self._source.capturing
+                was_capturing = source.capturing
                 result = self._mapper.tick(dt)
+                # 鼠标诊断：捕获期间每 2 秒一条（仅 DEBUG，默认不写日志面板；
+                # 排鼠标问题时把日志级别开到 DEBUG 就能看）
+                if source.capturing and now - last_mouse_log >= 2.0:
+                    last_mouse_log = now
+                    raw_count, raw_motion = source.raw_mouse_stats()
+                    logging.getLogger("ps5kbm.raw_mouse").debug(
+                        "鼠标诊断：Raw %d 帧/%d 位移 → 映射 %d 帧/%d 位移；"
+                        "右摇杆峰值 %.2f 当前 (%+.2f,%+.2f)；raw_ok=%s",
+                        raw_count,
+                        raw_motion,
+                        mouse_frames,
+                        mouse_motion,
+                        mouse_peak,
+                        result.right[0],
+                        result.right[1],
+                        source.raw_mouse_ok,
+                    )
+                    mouse_frames = 0
+                    mouse_motion = 0
+                    mouse_peak = 0.0
+                if abs(result.right[0]) > mouse_peak:
+                    mouse_peak = abs(result.right[0])
+                if abs(result.right[1]) > mouse_peak:
+                    mouse_peak = abs(result.right[1])
                 # 回到 60Hz 发送：和 PS5 输入采样对齐，左摇杆变化时立即发
                 left_changed = result.left != last_left
                 last_left = result.left
@@ -1000,7 +1108,19 @@ class Ps5KbmApp:
         if self._bridge is None:
             self._append_log("还没有连接主机，先到「连接」页建立会话")
             return
-        state = self._source.toggle_capture()
+        if self._controller_mode():
+            # 手柄玩法：手柄一直在转发，不需要捕获，也不该抢键盘鼠标
+            self._append_log("手柄玩法不需要捕获：手柄输入一直在转发，键鼠照常可用")
+            return
+        source = self._source
+        if source is None:
+            # 键鼠侧不存在（例如刚切到别的玩法）：没有捕获可言
+            return
+        previous = source.capturing
+        state = source.toggle_capture()
+        if previous:
+            # 参考实现：失去焦点就松开手柄效果，避免扳机一直硬着 / 马达一直转
+            self._release_controller_effects()
         self._apply_capture_state(state)
 
     def _on_capture_changed(self, capturing: bool) -> None:
@@ -1017,8 +1137,157 @@ class Ps5KbmApp:
         """手柄页用的当前状态（没连接返回 None）。"""
         return self._controller.snapshot() if self._controller.connected else None
 
+    # ------------------------------------------------- 玩法隔离：键鼠侧 / 手柄侧
+    # 两个玩法不共享任何本机输入对象：同一时刻只有一侧被实例化、被启动。
+    #   键鼠玩法：_source（pynput 监听 + 键鼠钩子 + 全局热键 + Raw Input 窗口）、8ms 消息泵
+    #   手柄玩法：_controller 读取线程（HID 句柄）、_usb_haptics 音频端点、100ms 页面轮询
+    # 共用的只有远程会话这一层：bridge 的反馈回调常驻注册，但全部经 _pad_forward_active()
+    # 闸门，键鼠玩法下不会写到实体手柄上。
+    # 所有入口（启动 / 切换玩法 / 连接 / 断开 / 重建映射 / 关窗）都只走这一组方法，
+    # 不允许在别处零散地 start/stop，否则等于又退回「两份对象都活着，靠闸门兜底」。
+
+    def _current_side(self) -> str:
+        """当前玩法 id：controller / keyboard。"""
+        return "controller" if self._controller_mode() else "keyboard"
+
+    def _new_input_source(self) -> InputSource:
+        """按当前映射器造一套键鼠输入对象，回调 / 模式键 / 调参键一次接好。"""
+        source = InputSource(self._mapper, hotkey=self._config.hotkey)
+        source.set_capture_callback(self._on_capture_changed)
+        source.set_key_callback(self._on_key_event)
+        source.set_mode_switch(self._config.mode_switch, self._on_mode_switch)
+        source.set_trigger_adjust(
+            config.trigger_adjust_keys(self._config), self._on_adjust
+        )
+        return source
+
+    def _init_keyboard_side(self) -> None:
+        """建起键鼠侧：没有会话时只实例化对象，不装钩子（保持「连上才装」的旧行为）。"""
+        if self._controller_mode():
+            return  # 手柄玩法不持有任何键鼠对象
+        if self._source is None:
+            self._source = self._new_input_source()
+        if self._bridge is not None and not self._source_ready:
+            try:
+                self._source.start()
+                self._source_ready = True
+            except Exception as exc:  # noqa: BLE001 - 起不来就别留半套钩子
+                logging.getLogger(__name__).warning("启动键鼠输入层失败：%s", exc)
+                self._release_keyboard_side()
+                return
+        self._ensure_pump_loop()
+
+    def _release_keyboard_side(self) -> None:
+        """拆掉键鼠侧整套：松键 → 停捕获 → 解钩子 / 注销热键 / 停监听 / 销毁 Raw Input 窗口。"""
+        self._stop_pump_loop()
+        self._overlay.hide()
+        self._capture_button.configure(text="开始捕获")
+        source = self._source
+        if source is None:
+            return
+        try:
+            if source.capturing:
+                source.set_capturing(False)
+                if self._bridge is not None:
+                    # 别把键留在按下状态，否则主机会一直以为还按着
+                    self._bridge.send_events(self._mapper.release_all())
+            source.release_cursor()
+        except Exception as exc:  # noqa: BLE001 - 释放失败也不能挡住后面的拆解
+            logging.getLogger(__name__).warning("停止键鼠捕获时出错：%s", exc)
+        try:
+            source.stop()
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("释放键鼠输入层失败：%s", exc)
+        self._source = None
+        self._source_ready = False
+        self._logged_keys.clear()
+        self._mapper.drop_missing(set())
+
+    def _init_controller_side(self) -> None:
+        """建起手柄侧：启动 HID 读取线程、数手柄、按连接方式决定触觉模式。"""
+        self._controller_buttons_sent.clear()
+        self._last_trigger_sent.clear()
+        self._last_ctrl_sticks = ((0.0, 0.0), (0.0, 0.0))
+        self._last_ctrl_send = 0.0
+        self._pending_controller_release = False
+        self._last_trigger_blocks.clear()
+        self._trigger_mode_counts.clear()
+        self._trigger_filter.reset()
+        self._last_lightbar = b""
+        self._gyro_axis.reset()
+        self._gyro_output = (0.0, 0.0)
+        self._haptics_pad_count = 0
+        self._haptics_multi_logged = False
+        self._mode_warned = False
+        self._controller_was_connected = self._controller.connected
+        # 触觉输出能力只在本次运行第一次进手柄玩法时探测一次：键鼠玩法下连 PortAudio 都不初始化
+        if not self._haptics_env_logged:
+            self._haptics_env_logged = True
+            logging.getLogger("ps5kbm.haptics").info(
+                "触觉输出：%s", haptics_usb.describe_environment()
+            )
+        self._controller.start_reader()
+        self._update_haptics_pad_count()
+        self._update_haptics_mode()
+        self._ensure_controller_poll()
+
+    def _release_controller_side(self) -> None:
+        """拆掉手柄侧整套：先写释放报告（扳机 / 马达），再关触觉端点与 HID 句柄。"""
+        # 顺序很重要：释放报告要靠还开着的 HID 句柄，触觉模式也要在旧玩法下判断
+        self._release_controller_effects()
+        try:
+            self._usb_haptics.close()
+        except Exception as exc:  # noqa: BLE001 - 关端点失败不影响后续拆解
+            logging.getLogger(__name__).warning("关闭触觉端点失败：%s", exc)
+        self._haptic_tone_chunks.clear()
+        self._last_trigger_blocks.clear()
+        self._trigger_mode_counts.clear()
+        self._controller_buttons_sent.clear()
+        self._last_trigger_sent.clear()
+        self._last_ctrl_sticks = ((0.0, 0.0), (0.0, 0.0))
+        self._pending_controller_release = False
+        self._last_lightbar = b""
+        self._trigger_filter.reset()
+        self._haptics_pad_count = 0
+        self._haptics_multi_logged = False
+        self._stop_controller_poll()
+        try:
+            self._controller.stop()  # 关 HID 句柄、结束读取线程、复位触觉模式
+        except Exception as exc:  # noqa: BLE001
+            logging.getLogger(__name__).warning("停止手柄读取失败：%s", exc)
+        self._controller_was_connected = False
+        self._mode_warned = False
+
+    def _leave_input_side(self, side: str) -> None:
+        if side == "controller":
+            self._release_controller_side()
+        else:
+            self._release_keyboard_side()
+
+    def _enter_input_side(self, side: str) -> None:
+        if side == "controller":
+            self._init_controller_side()
+        else:
+            self._init_keyboard_side()
+
+    def _sync_input_lifecycle(self) -> None:
+        """按当前玩法收敛两侧状态：先拆另一侧，再建当前侧（启动 / 连接 / 切换都走这里）。"""
+        side = self._current_side()
+        self._leave_input_side("keyboard" if side == "controller" else "controller")
+        self._enter_input_side(side)
+        # 只在本次运行第一次写 INFO（启动时一行足够）；连接/断开等后续变化走 DEBUG
+        logger = logging.getLogger(__name__)
+        logger.log(
+            logging.INFO if not self._lifecycle_logged else logging.DEBUG,
+            "玩法隔离：当前 %s；键鼠侧=%s 手柄侧=%s",
+            "手柄直通" if side == "controller" else "键鼠映射",
+            "已实例化" if self._source is not None else "未实例化",
+            "读取线程在跑" if self._controller.is_alive() else "已停止",
+        )
+        self._lifecycle_logged = True
+
     def set_input_mode(self, label: str) -> None:
-        """连接前选择玩法：键鼠映射 / 手柄直通。"""
+        """切换玩法：先把旧玩法整侧拆掉，再把新玩法整侧建起来。"""
         mode = controller_ui.MODE_LABELS.get(label, "keyboard")
         if self._bridge is not None:
             messagebox.showwarning(
@@ -1033,19 +1302,49 @@ class Ps5KbmApp:
         if mode == self._config.controller.mode:
             self._input_mode_var.set(label)
             return
+        previous = self._current_side()
+        # 先在旧玩法下释放：扳机 / 马达的释放报告要靠旧玩法仍生效、HID 还开着
+        self._leave_input_side(previous)
         self._config.controller.mode = mode
         self._input_mode_var.set(label)
-        self._persist()
+        self._enter_input_side(mode)
+        self._apply_capture_state(False)
         self._update_nav()
+        self._persist()
         self._append_log(
             "玩法："
-            + ("手柄（手柄页用于查看 / 设置手柄连接）" if mode == "controller" else "键鼠（连上 PS5 后显示映射 / 运行）")
+            + (
+                "手柄（手柄页用于查看 / 设置手柄连接）"
+                if mode == "controller"
+                else "键鼠（连上 PS5 后显示映射 / 运行）"
+            )
+            + f" · 已释放{'手柄侧' if previous == 'controller' else '键鼠侧'}，"
+            f"已初始化{'手柄侧' if mode == 'controller' else '键鼠侧'}"
         )
 
     def refresh_controller(self) -> None:
         """页面上的「重新检测」：让后台线程立刻再试一次。"""
+        if not self._controller_mode():
+            return  # 键鼠玩法不持有手柄读取线程
         self._controller.start_reader()
         self._append_log("正在重新检测手柄……")
+
+    def _update_haptics_pad_count(self) -> None:
+        """数一下当前接了几个 Sony 手柄（参考实现要求唯一才路由触觉）。
+
+        只在手柄连接状态变化时枚举一次：HID 枚举是原生调用，别放在每帧路径上。
+        """
+        try:
+            paths = {bytes(info.path or b"") for info in dualsense.list_devices()}
+            self._haptics_pad_count = len(paths)
+        except Exception:  # noqa: BLE001 - 枚举失败就当没有
+            self._haptics_pad_count = 0
+        if self._haptics_pad_count > 1 and not self._haptics_multi_logged:
+            self._haptics_multi_logged = True
+            self._append_log(
+                f"检测到 {self._haptics_pad_count} 个 Sony 手柄，"
+                "USB 触觉暂不路由（参考实现同样要求手柄唯一）"
+            )
 
     def _poll_controller(self) -> None:
         """界面轮询：刷新手柄页状态、处理断连、跑陀螺仪校准采样。"""
@@ -1058,8 +1357,21 @@ class Ps5KbmApp:
                     self._append_log(
                         f"手柄已连接：{self._controller.device_label or 'DualSense'}"
                     )
+                    # 新手柄（或刚插线）灯条是固件默认色，清掉记录让 pad_info 重新写
+                    self._last_lightbar = b""
+                    self._trigger_filter.reset()
+                    self._update_haptics_pad_count()
+                    self._update_haptics_mode()
                 else:
                     self._append_log("手柄已断开")
+                    # 参考实现：手柄不再被读取时，触觉流和扳机效果一起放掉，
+                    # 否则音频端点会一直占着一个已经不存在的设备
+                    self._usb_haptics.close()
+                    self._haptic_tone_chunks.clear()
+                    self._trigger_filter.reset()
+                    self._last_trigger_blocks.clear()
+                    self._last_lightbar = b""
+                    self._haptics_pad_count = 0
                     if self._controller_mode():
                         self._pending_controller_release = True
             if self._controller_mode() and not connected and not self._mode_warned:
@@ -1090,7 +1402,27 @@ class Ps5KbmApp:
                 controller_ui.refresh(self)
             except Exception:  # noqa: BLE001 - 页面还没建好时忽略
                 pass
-            self._poll_job = self.root.after(100, self._poll_controller)
+            # 键鼠玩法下不再自我续期：手柄侧不存在，轮询也该停
+            if self._controller_mode():
+                self._poll_job = self.root.after(100, self._poll_controller)
+            else:
+                self._poll_job = None
+
+    def _ensure_controller_poll(self) -> None:
+        """确保手柄页轮询在跑（只有手柄玩法需要）。"""
+        if self._poll_job is not None or not self._controller_mode():
+            return
+        self._poll_job = self.root.after(120, self._poll_controller)
+
+    def _stop_controller_poll(self) -> None:
+        """停掉手柄页轮询（切到键鼠玩法 / 关窗）。"""
+        job = self._poll_job
+        self._poll_job = None
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # noqa: BLE001 - 关窗时 Tk 可能已经销毁
+                pass
 
     # ------------------------------------------------------------ 陀螺仪
     def _gyro_params(self) -> gyro.GyroParams:
@@ -1186,10 +1518,61 @@ class Ps5KbmApp:
         )
 
     # ------------------------------------------------------------ 震动 / 扳机
-    def _toggle_rumble(self) -> None:
-        enabled = bool(self._rumble_var.get())
-        self._config.controller.rumble_enabled = enabled
-        self._append_log("震动转发：" + ("开启" if enabled else "关闭"))
+    # 震动方式三选一：音频触觉（USB 独占，马达位会让它静音）/ 经典马达 / 关闭
+    VIBRATION_MODE_LABELS = ("音频触觉（USB）", "经典马达", "关闭")
+    _VIBRATION_MODE_KEYS = {
+        "音频触觉（USB）": "haptics",
+        "经典马达": "motors",
+        "关闭": "off",
+    }
+
+    def vibration_mode(self) -> str:
+        """当前震动方式：haptics / motors / off。"""
+        if self._config.controller.haptics_usb:
+            return "haptics"
+        if self._config.controller.rumble_enabled:
+            return "motors"
+        return "off"
+
+    def vibration_mode_label(self) -> str:
+        mode = self.vibration_mode()
+        for label, key in self._VIBRATION_MODE_KEYS.items():
+            if key == mode:
+                return label
+        return "经典马达"
+
+    def vibration_hint_text(self) -> str:
+        """手柄页那行说明：随连接方式和当前选择变化。"""
+        mode = self.vibration_mode()
+        connected = self._controller.connected
+        usb = connected and self._controller.transport == "usb"
+        if mode == "off":
+            return "震动已关闭：主机下发的震动与触觉都不再写入手柄"
+        if mode == "motors":
+            return "经典马达：主机震动值驱动两个马达，USB / 蓝牙都能用，手感较粗"
+        if not connected:
+            return "音频触觉：最接近原生的细碎手感，需要 USB 连接（插线后自动生效）"
+        if not usb:
+            return "当前是蓝牙：音频触觉用不了（蓝牙没有触觉通道），想有震动请选「经典马达」"
+        return "音频触觉：主机触觉音频直达手柄执行器，手感最接近原生（USB 独占）"
+
+    def set_vibration_mode(self, label: str) -> None:
+        """切换震动方式并落盘（音频触觉与经典马达互斥）。"""
+        mode = self._VIBRATION_MODE_KEYS.get(str(label), "motors")
+        cfg = self._config.controller
+        cfg.haptics_usb = mode == "haptics"
+        cfg.rumble_enabled = mode == "motors"
+        if not cfg.haptics_usb:
+            # 关掉音频触觉就释放音频端点
+            self._usb_haptics.close()
+            self._haptic_tone_chunks.clear()
+        self._update_haptics_mode()
+        if hasattr(self, "_vibration_mode_var"):
+            self._vibration_mode_var.set(self.vibration_mode_label())
+        message = "震动方式：" + self.vibration_mode_label()
+        if mode == "haptics" and self._controller.connected and self._controller.transport != "usb":
+            message += "（音频触觉需要 USB，当前是蓝牙）"
+        self._append_log(message)
         self._persist()
 
     def _apply_rumble_gain(self, value: float) -> None:
@@ -1201,20 +1584,43 @@ class Ps5KbmApp:
         if not self._controller.connected:
             self._append_log("先接上手柄再试震动")
             return
-        self._controller.rumble(0.8, 0.8)
-        self.root.after(250, lambda: self._controller.rumble(0.0, 0.0))
-        # USB 下同时给 3/4 声道送一段 60Hz 触觉波形，单独验证原生触觉通道
-        if self._controller.transport == "usb" and self._config.controller.haptics_usb:
-            import numpy as np
+        # 触觉模式与经典马达互斥（马达使能位会让音频触觉静音）：
+        # 先临时切回马达通道，300ms 后自动恢复音频触觉
+        haptics_active = self._controller.haptics_mode
+        if haptics_active:
+            self._controller.set_haptics_mode(False)
+        self._controller.rumble(0.8, 0.8, force=True)
+        self.root.after(250, lambda: self._controller.rumble(0.0, 0.0, force=True))
+        if haptics_active:
 
-            sample_rate = 48000
-            count = int(sample_rate * 0.6)
-            wave = (np.sin(np.linspace(0, 2 * np.pi * 60 * 0.6, count)) * 6000).astype(np.int16)
-            stereo = np.stack([wave, wave], axis=1).tobytes()
-            self._usb_haptics.feed(stereo)
-            self._append_log("试震动：马达 + USB 触觉波形（3/4 声道，应持续约 0.6 秒）")
+            def restore_haptics() -> None:
+                self._controller.set_haptics_mode(True)
+                self._controller.unlock_audio()
+
+            self.root.after(350, restore_haptics)
+        # USB 下同时给 3/4 声道送一段 60Hz 触觉波形，单独验证原生触觉通道。
+        # 触觉源固定 3kHz、单包上限 100ms，所以按 30ms 节奏逐包喂，
+        # 一次性塞 0.6 秒会被队列上限整段清空（等于没声音）。
+        if self._controller.transport == "usb" and self._config.controller.haptics_usb:
+            self._haptic_tone_chunks = haptics_usb.test_tone_chunks(0.6)
+            self._haptic_tone_tick()
+            if self._usb_haptics.is_open():
+                self._append_log("试震动：马达 + USB 触觉波形（3/4 声道，约 0.6 秒）")
+            else:
+                self._append_log(
+                    "试震动：马达已发；USB 触觉端点没打开"
+                    "（确认手柄插在 PC 的 USB 口上，日志里有打开失败的原因）"
+                )
             return
         self._append_log("试震动：马达（USB 连接才会有原生触觉）")
+
+    def _haptic_tone_tick(self) -> None:
+        """按 30ms 节奏把试震动波形喂给触觉端点（跑在界面线程）。"""
+        chunks = self._haptic_tone_chunks
+        if not chunks:
+            return
+        self._usb_haptics.feed(chunks.pop(0))
+        self.root.after(30, self._haptic_tone_tick)
 
     def _on_rumble(self, low: float, high: float) -> None:
         """主机下发的震动 → 本地手柄（协议层验证后再接进来）。"""
@@ -1225,10 +1631,53 @@ class Ps5KbmApp:
         self._controller.rumble(low * gain, high * gain)
 
     # ------------------------------------------------- 主机下发反馈（后台线程）
+    def _pad_forward_active(self) -> bool:
+        """只有「手柄玩法 + 手柄已连接」才允许碰实体手柄。
+
+        键鼠玩法下主机照样会把震动/扳机/灯条/触觉推下来，但那时实体手柄不该被我们
+        占用（否则一直在写它的马达/灯条，还会把它切到触觉模式）。两个玩法彻底隔断。
+        """
+        return self._controller_mode() and self._controller.connected
+
+    def _release_controller_effects(self) -> None:
+        """照参考实现的 releaseEffects()：马达归零 + 两边扳机释放 + 清本地记录。
+
+        参考实现（Veyra ControllerInput.cpp）在失去焦点、手柄断开、会话结束时都调它：
+        不清的话扳机会一直硬着、马达会一直转，音频端点也还占着。
+        """
+        self._last_trigger_blocks.clear()
+        if not self._controller_mode() or not self._controller.connected:
+            return
+        try:
+            # 先让马达归零：之后写的扳机/灯条报告会带着缓存值，不归零会继续转
+            self._controller.rumble(0.0, 0.0)
+            # 两边扳机一次写成 Off（模式 0x05），不会互相覆盖
+            self._controller.set_trigger_effects()
+        except Exception:  # noqa: BLE001 - 放掉效果失败不影响主流程
+            pass
+    def _update_haptics_mode(self) -> None:
+        """USB + 开关打开 + 已连接 + 手柄玩法 → 走音频触觉，此时不再发经典马达。
+
+        实机结论：输出报告里只要带上马达使能位（valid_flag0 的 0x01|0x02），
+        手柄就切到「兼容震动」模式，音频触觉立刻静音——这就是游戏里一点震动都没有的原因。
+        """
+        active = (
+            self._config.controller.haptics_usb
+            and self._controller_mode()
+            and self._controller.connected
+            and self._controller.transport == "usb"
+        )
+        self._controller.set_haptics_mode(active)
+
     def _on_console_rumble(self, left: float, right: float) -> None:
         """主机下发的震动值（0~1，跑在协议线程）：转发到本地手柄。"""
         cfg = self._config.controller
-        if not cfg.rumble_enabled or not self._controller.connected:
+        if not self._pad_forward_active():
+            return
+        if not cfg.rumble_enabled:
+            return
+        if self._controller.haptics_mode:
+            # 触觉模式下马达通道是关的（发了会静音触觉），直接跳过
             return
         now = time.monotonic()
         if now - self._last_console_rumble < 0.02:
@@ -1241,29 +1690,85 @@ class Ps5KbmApp:
         )
 
     def _on_haptics_pcm(self, pcm: bytes) -> None:
-        """主机下发的触觉 PCM（跑在解码线程）：只有 USB 连接才写到手柄音频端点。"""
+        """主机下发的触觉 PCM（跑在解码线程）：只有手柄玩法 + USB 才写到手柄音频端点。"""
+        if not self._pad_forward_active():
+            # 键鼠玩法完全不碰实体手柄：连日志都不记，避免看起来像"还在收触觉流"
+            return
+        # 诊断计数：每 5 秒记一行，用来判断「主机有没有发、数据是不是静音、写到哪一步停了」
+        now = time.monotonic()
+        self._haptics_rx += 1
+        self._haptics_last_size = len(pcm)
+        if len(pcm) >= 4:
+            middle = len(pcm) // 2
+            sample = int.from_bytes(pcm[middle : middle + 2], "little", signed=True)
+            self._haptics_peak = max(self._haptics_peak, abs(sample))
+        if now - self._haptics_stats_at >= 5.0:
+            self._haptics_stats_at = now
+            underruns, queued, refills, _ratio = self._usb_haptics.stats()
+            # 常态只写 DEBUG（不刷日志面板）；只有出现「新的欠载」时才写一条 INFO，
+            # 这样日志里只看得到真正需要关注的事件。
+            new_underruns = underruns - self._haptics_underruns_prev
+            self._haptics_underruns_prev = underruns
+            logger = logging.getLogger("ps5kbm.haptics")
+            level = logging.INFO if new_underruns > 0 else logging.DEBUG
+            logger.log(
+                level,
+                "触觉流：收到 %d 包 / 写入 %d 包 / 峰值 %d / 包长 %d"
+                " / 欠载 %d（新 %d）/ 恢复 %d / 队列 %d/%d 帧（上限）"
+                "（transport=%s connected=%s 流=%s 开关=%s 多手柄=%d 触觉模式=%s）",
+                self._haptics_rx,
+                self._haptics_tx,
+                self._haptics_peak,
+                self._haptics_last_size,
+                underruns,
+                new_underruns,
+                refills,
+                queued,
+                self._usb_haptics.target_frames(),
+                self._controller.transport,
+                self._controller.connected,
+                self._usb_haptics.is_open(),
+                self._config.controller.haptics_usb,
+                self._haptics_pad_count,
+                self._controller.haptics_mode,
+            )
+            self._haptics_rx = 0
+            self._haptics_tx = 0
+            self._haptics_peak = 0
         if not self._config.controller.haptics_usb:
             return
         if self._controller.transport != "usb":
             return
+        if self._haptics_pad_count > 1:
+            # 四声道端点 + 手柄都必须唯一，否则不路由（分不清是哪只的端点）
+            return
         self._usb_haptics.feed(pcm)
+        self._haptics_tx += 1
 
-    def _toggle_haptics_usb(self) -> None:
-        enabled = bool(self._haptics_var.get())
-        self._config.controller.haptics_usb = enabled
-        self._append_log("USB 震动：" + ("开启" if enabled else "关闭"))
-        self._persist()
+    def _on_console_led(self, rgb: bytes) -> None:
+        """主机下发的灯条颜色（data_type 9，跑在协议线程）：同步到手柄灯条。"""
+        if not self._pad_forward_active():
+            return
+        if rgb == self._last_lightbar:
+            return
+        self._last_lightbar = rgb
+        self._controller.set_lightbar(rgb)
 
     def _on_console_trigger_effect(self, left: bytes, right: bytes) -> None:
-        """主机下发的扳机效果块（各 11 字节，跑在协议线程）：有变化才写手柄。"""
+        """主机下发的扳机效果块（各 11 字节，跑在协议线程）。
+
+        照 chiaki / Veyra 的做法：左右两块合成**一份报告**一起写。
+        分开写会让后一份报告覆盖前一份，只有最后一侧生效。
+        另一侧没变化时沿用上一次的块，不会把已有效果清掉。
+        """
         cfg = self._config.controller
-        if not cfg.adaptive_triggers or not self._controller.connected:
+        if not self._pad_forward_active():
             return
+        if not cfg.adaptive_triggers:
+            return
+        changed = False
         for side, block in (("l", left), ("r", right)):
             if not block or len(block) != 11:
-                continue
-            previous = self._last_trigger_blocks.get(side)
-            if previous == block:
                 continue
             # 主机在开车/刹车时发 0x05（HID 里是 Off）但带非零参数，
             # 实际含义是「反馈阻力」；实机验证改写成 0x21 后油门/刹车阻尼正常。
@@ -1271,20 +1776,39 @@ class Ps5KbmApp:
             if block[0] == 0x05 and any(block[1:]):
                 block[0] = 0x21
             block = bytes(block)
+            if self._last_trigger_blocks.get(side) == block:
+                continue
             self._last_trigger_blocks[side] = block
-            self._trigger_effect_time[side] = time.monotonic()
+            self._trigger_mode_counts[block[0]] = (
+                self._trigger_mode_counts.get(block[0], 0) + 1
+            )
+            now = time.monotonic()
+            if now - self._trigger_stats_at >= 5.0:
+                self._trigger_stats_at = now
+                summary = " ".join(
+                    f"0x{mode:02X}×{count}"
+                    for mode, count in sorted(self._trigger_mode_counts.items())
+                )
+                logging.getLogger("ps5kbm.trigger").debug(
+                    "扳机效果类型（近 5 秒，已写入手柄）：%s", summary or "无"
+                )
+                self._trigger_mode_counts.clear()
             logging.getLogger("ps5kbm.trigger").debug(
                 "扳机效果 %s 类型 0x%02X：%s", side, block[0], block.hex()
             )
-            self._controller.set_trigger_effect(side, block)
+            changed = True
+        if changed:
+            self._controller.set_trigger_effects(
+                self._last_trigger_blocks.get("l"),
+                self._last_trigger_blocks.get("r"),
+            )
 
     def stop_trigger_effect(self) -> None:
         """立刻停掉两边的扳机效果（不受开关影响，任何时候都能放掉）。"""
         if not self._controller.connected:
             self._append_log("手柄没连上，没法停扳机效果")
             return
-        self._controller.clear_trigger_effect("r")
-        self._controller.clear_trigger_effect("l")
+        self._controller.clear_trigger_effect()
         self._last_trigger_blocks.clear()
         self._trigger_effect_var.set("关闭")
         self._append_log("已停止扳机效果（R2 / L2）")
@@ -1292,14 +1816,11 @@ class Ps5KbmApp:
     def _toggle_adaptive_triggers(self) -> None:
         enabled = bool(self._adaptive_trigger_var.get())
         self._config.controller.adaptive_triggers = enabled
-        if not enabled and self._controller.connected:
-            # 关掉开关时顺手把已经写进去的效果放掉，避免扳机一直硬着
-            self._controller.clear_trigger_effect("r")
-            self._controller.clear_trigger_effect("l")
         if not enabled:
-            self._last_trigger_blocks.clear()
+            # 关掉开关时顺手把已经写进去的效果放掉，避免扳机一直硬着
+            self._release_controller_effects()
         self._append_log(
-            "自适应扳机：" + ("开启" if enabled else "关闭") + "（本地效果可用）"
+            "自适应扳机：" + ("开启" if enabled else "关闭")
         )
         self._persist()
 
@@ -1324,14 +1845,13 @@ class Ps5KbmApp:
         side = self._trigger_side_var.get()
         sides = ("r", "l") if side == "双" else (("r",) if side == "R2" else ("l",))
         if name == "关闭":
-            for item in sides:
-                self._controller.clear_trigger_effect(item)
+            self._controller.clear_trigger_effect()
             self._append_log("已关闭扳机效果" + ("（双）" if side == "双" else f"（{side}）"))
             return
         effect = dualsense.effect_bytes(name)
-        ok = True
-        for item in sides:
-            ok = self._controller.set_trigger_effect(item, effect) and ok
+        left_effect = effect if "l" in sides else None
+        right_effect = effect if "r" in sides else None
+        ok = self._controller.set_trigger_effects(left_effect, right_effect)
         self._append_log(
             f"扳机效果：{name}"
             + ("（双）" if side == "双" else f"（{side}）")
@@ -1353,23 +1873,22 @@ class Ps5KbmApp:
             self._last_ctrl_send = now
             self._last_ctrl_sticks = (left, right)
             self._bridge.set_sticks(left, right)
-        # 扳机走模拟量事件，变化超过 1/100 才发
-        for name, value in (("l2", state.l2), ("r2", state.r2)):
-            # 有扳机阻力时，浅松可能残留 0.05~0.15 的读数；
-            # 这个区间游戏本来就不算按下，直接按 0 发，避免“浅出识别不到”。
-            value = 0.0 if value < 0.15 else value
-            last = self._last_trigger_sent.get(name, 0.0)
-            pressed = value > 0.15
-            if self._trigger_pressed.get(name) and not pressed:
-                # 松开瞬间强制发一次 0，并清掉陀螺仪残留，避免“按着不放”的错觉
-                self._last_trigger_sent[name] = 0.0
-                self._bridge.set_trigger(name, 0.0)
+        # 扳机：先过滤抖动再发（参考实现 TriggerFilter）。
+        # 每个值变化都会生成一条 history 事件，而每个包只带最新 8 条；
+        # 一侧松开、另一侧还按着并抖动时，松开会被挤出窗口，主机就认为没松。
+        l2_byte, r2_byte = self._trigger_filter.apply(
+            trigger_filter.to_byte(state.l2), trigger_filter.to_byte(state.r2), now
+        )
+        for name, byte_value in (("l2", l2_byte), ("r2", r2_byte)):
+            last = self._last_trigger_sent.get(name)
+            if last == byte_value:
+                continue
+            self._last_trigger_sent[name] = byte_value
+            self._bridge.set_trigger(name, byte_value / 255.0)
+            if byte_value == 0 and last:
+                # 松开时清掉陀螺仪残留，避免右摇杆被带着漂
                 self._gyro_axis.reset()
                 self._gyro_output = (0.0, 0.0)
-            elif abs(value - last) >= 0.01:
-                self._last_trigger_sent[name] = value
-                self._bridge.set_trigger(name, value)
-            self._trigger_pressed[name] = pressed
         pressed = {name for name in state.buttons if name not in ("L2", "R2")}
         events: list[tuple[str, str]] = []
         for name in sorted(pressed - self._controller_buttons_sent):
@@ -1423,6 +1942,7 @@ class Ps5KbmApp:
         if self._bridge is None:
             self._controller_buttons_sent.clear()
             self._last_trigger_sent.clear()
+            self._trigger_filter.reset()
             return
         events = [(name, "release") for name in sorted(self._controller_buttons_sent)]
         self._controller_buttons_sent.clear()
@@ -1431,6 +1951,7 @@ class Ps5KbmApp:
         for name in ("l2", "r2"):
             self._bridge.set_trigger(name, 0.0)
         self._last_trigger_sent.clear()
+        self._trigger_filter.reset()
         self._bridge.set_sticks((0.0, 0.0), (0.0, 0.0))
         self._gyro_axis.reset()
         self._gyro_output = (0.0, 0.0)
@@ -1791,9 +2312,10 @@ class Ps5KbmApp:
                 )
                 return
             setattr(self._config, action, name)
-            self._source.set_trigger_adjust(
-                config.trigger_adjust_keys(self._config), self._on_adjust
-            )
+            if self._source is not None:
+                self._source.set_trigger_adjust(
+                    config.trigger_adjust_keys(self._config), self._on_adjust
+                )
             self._persist()
             run_tuning_ui.refresh_trigger_buttons(self)
             self._append_log(
@@ -1988,23 +2510,16 @@ class Ps5KbmApp:
                 self._append_log(f"预设保存失败：{exc}")
 
     def _rebuild_mapper(self) -> None:
-        was_capturing = self._source.capturing and self._source_ready
-        if self._source_ready:
-            self._source.stop()
+        was_capturing = bool(
+            self._source is not None and self._source.capturing and self._source_ready
+        )
+        # 旧输入对象整套扔掉（钩子 / 热键 / Raw Input 窗口一起释放），再按当前玩法重建。
+        # 手柄玩法下 _init_keyboard_side 什么都不做，_source 保持 None。
+        self._release_keyboard_side()
         self._mapper = InputMapper(self._config)
         self._mapper.set_left_value(self._config.left_stick.value)
-        self._source = InputSource(self._mapper, hotkey=self._config.hotkey)
-        self._source.set_capture_callback(self._on_capture_changed)
-        self._source.set_key_callback(self._on_key_event)
-        self._source.set_mode_switch(self._config.mode_switch, self._on_mode_switch)
-        self._source.set_trigger_adjust(
-            config.trigger_adjust_keys(self._config), self._on_adjust
-        )
-        self._source_ready = False
-        if self._bridge is not None:
-            self._source.start()
-            self._source_ready = True
-        if was_capturing:
+        self._init_keyboard_side()
+        if was_capturing and self._source is not None:
             # 捕获中改了映射：重建后必须把捕获接回去，否则覆盖层还开着、
             # 按钮还写着「停止捕获」，实际输入却已经断了。
             self._source.set_capturing(True)
@@ -2080,13 +2595,10 @@ class Ps5KbmApp:
 
     def _on_close(self) -> None:
         self._running = False
-        # 先取消手柄轮询定时器，否则关窗时 Tk 会报 invalid command name
-        try:
-            if self._poll_job is not None:
-                self.root.after_cancel(self._poll_job)
-                self._poll_job = None
-        except Exception:  # noqa: BLE001
-            pass
+        # 先取消两个 Tk 定时器（手柄轮询 / Raw Input 消息泵），否则关窗时 Tk 会报
+        # invalid command name
+        self._stop_controller_poll()
+        self._stop_pump_loop()
         try:
             self._overlay.hide()
         except Exception:  # noqa: BLE001
@@ -2097,10 +2609,8 @@ class Ps5KbmApp:
             pass
         try:
             self._stop_tick_loop()
-            if self._source_ready:
-                if self._source.capturing:
-                    self._source.toggle_capture()
-                self._source.stop()
+            # 键鼠侧整套拆掉（解钩子 / 注销热键 / 销毁 Raw Input 窗口 / 松键）
+            self._release_keyboard_side()
             if self._bridge is not None:
                 future = asyncio.run_coroutine_threadsafe(self._bridge.close(), self._loop)
                 future.result(timeout=5)
@@ -2111,6 +2621,11 @@ class Ps5KbmApp:
 
 
 def main() -> int:
+    # 单实例：两个实例会抢同一个手柄的 HID 句柄，还会互相覆盖 config.json。
+    # 第二次启动不弹窗，直接把已经在跑的那个窗口切到前台就退出。
+    if not windows.acquire_single_instance():
+        windows.activate_by_title("XY-CtoPS5")
+        return 0
     # 声明 DPI 感知：系统缩放不是 100% 时，DPI-unaware 进程的
     # SetCursorPos 与 GetCursorPos 使用的坐标系不一致，锁回光标后位置
     # 仍会偏移一大截，每帧都被算成巨大位移——表现为视角狂飘。

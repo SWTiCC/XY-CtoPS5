@@ -89,5 +89,82 @@ class TriggerEffectTests(unittest.TestCase):
         self.assertAlmostEqual(ds.ACCEL_RAW_TO_G, 1.0 / 8192.0, places=12)
 
 
+class AudioUnlockTests(unittest.TestCase):
+    """打开音频/触觉通路的报告内容（纯字节，不碰硬件）。"""
+
+    def _capture(self, transport: str) -> bytes:
+        reader = ds.DualSenseReader()
+        reader._transport = transport  # noqa: SLF001 - 测试内部状态
+        captured = {}
+
+        def fake_write(report):
+            captured["report"] = bytes(report)
+            return True
+
+        reader._write = fake_write  # noqa: SLF001
+        self.assertTrue(reader.unlock_audio())
+        return captured["report"]
+
+    def test_usb_report_enables_audio_and_clears_mutes(self):
+        report = self._capture("usb")
+        # valid_flag0 = 0xF0（只开音频相关，不带马达使能位）
+        self.assertEqual(report[1], 0xF0)
+        # valid_flag1 需要 allow_audio_mute(0x02)
+        self.assertTrue(report[2] & 0x02)
+        # 马达字节归零
+        self.assertEqual(report[3], 0)
+        self.assertEqual(report[4], 0)
+        # 音量：耳机 / 扬声器 / 麦克风 = 0x64
+        self.assertEqual(report[5], 0x64)
+        self.assertEqual(report[6], 0x64)
+        self.assertEqual(report[7], 0x64)
+        # power_save_mute_control 必须清零（MUTE_SPEAKER 0x20 / MUTE_HAPTIC 0x80）
+        self.assertEqual(report[10], 0x00)
+        self.assertEqual(report[40], 0x00)  # 触觉低通关闭
+
+    def test_bluetooth_report_is_shifted_by_one(self):
+        report = self._capture("bt")
+        self.assertEqual(report[0], ds.BT_OUTPUT_REPORT_ID)
+        self.assertEqual(report[2], 0xF0)  # BT valid_flag0 在 2
+        self.assertEqual(report[3] & 0x02, 0x02)
+        self.assertEqual(report[6], 0x64)  # 耳机音量
+        self.assertEqual(report[7], 0x64)  # 扬声器音量
+        self.assertEqual(report[11], 0x00)  # power_save_mute_control
+        self.assertEqual(report[41], 0x00)  # 触觉低通
+        self.assertEqual(report[4], 0)
+        self.assertEqual(report[5], 0)
+
+
+class HapticsModeTests(unittest.TestCase):
+    """触觉模式：报告里不能带马达使能位，否则音频触觉被静音。"""
+
+    def test_report_has_no_motor_bits_in_haptics_mode(self):
+        reader = ds.DualSenseReader()
+        reader._transport = "usb"  # noqa: SLF001
+        reader.set_haptics_mode(True)
+        report, _layout = reader._new_output_report()  # noqa: SLF001
+        self.assertEqual(report[1] & 0x03, 0)  # valid_flag0 没有 0x01|0x02
+        self.assertEqual(report[3], 0)
+        self.assertEqual(report[4], 0)
+
+    def test_report_has_motor_bits_when_haptics_off(self):
+        reader = ds.DualSenseReader()
+        reader._transport = "usb"  # noqa: SLF001
+        reader.set_haptics_mode(False)
+        report, _layout = reader._new_output_report()  # noqa: SLF001
+        self.assertEqual(report[1] & 0x03, 0x03)
+
+    def test_rumble_is_skipped_in_haptics_mode(self):
+        reader = ds.DualSenseReader()
+        reader._transport = "usb"  # noqa: SLF001
+        reader.set_haptics_mode(True)
+        writes = []
+        reader._write = lambda report: writes.append(bytes(report)) or True  # noqa: SLF001
+        self.assertFalse(reader.rumble(0.5, 0.5))
+        self.assertEqual(writes, [])
+        self.assertTrue(reader.rumble(0.5, 0.5, force=True))
+        self.assertEqual(len(writes), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

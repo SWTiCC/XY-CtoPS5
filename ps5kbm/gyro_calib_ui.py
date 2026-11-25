@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import math
+
 import tkinter as tk
 
 import customtkinter as ctk
@@ -17,6 +19,7 @@ from . import theme as T
 SAMPLE_SECONDS = 3.0
 SAMPLE_INTERVAL_MS = 50
 STABILITY_LIMIT = 0.08  # 超过它算"在动"，进度回落
+ACCEL_TOLERANCE = 0.12
 STILL_LIMIT = 0.02  # 低于它算"放稳了"，开始累计稳定时间
 WINDOW_SAMPLES = int(SAMPLE_SECONDS * 1000 / SAMPLE_INTERVAL_MS)
 SAMPLE_COUNT = WINDOW_SAMPLES
@@ -36,6 +39,7 @@ class GyroCalibDialog(ctk.CTkToplevel):
         self._job: str | None = None
         # 校准完成后自动关窗的定时器
         self._close_job: str | None = None
+        self._accel_warned = False
 
         self.title("陀螺仪校准")
         self.resizable(False, False)
@@ -187,6 +191,29 @@ class GyroCalibDialog(ctk.CTkToplevel):
             self._detail.configure(text="插上 USB 或配对蓝牙后会自动开始")
             self._progress.set(0.0)
         else:
+            # 参考实现的做法：除了陀螺仪静止，还要求加速度≈1g（真的平放没动），
+            # 否则手虽然在晃但角速度小的时候会被误判成“稳住了”。
+            # 防御：如果加速度模长根本不在物理范围内（说明该手柄的加速度刻度
+            # 和我们的换算不一致），就跳过这项检查，绝不能让校准卡死。
+            accel = getattr(state, "accel", None)
+            if accel:
+                magnitude = math.sqrt(sum(value * value for value in accel))
+                if 0.3 <= magnitude <= 3.0:
+                    if abs(magnitude - 1.0) > ACCEL_TOLERANCE:
+                        self._samples.clear()
+                        self._stable_time = 0.0
+                        self._status.configure(text="手柄没放平或还在动", text_color=T.WARN)
+                        self._detail.configure(
+                            text=f"重力 {magnitude:.2f}g（需要 ≈1.00g）· 平放在桌面保持静止"
+                        )
+                        self._progress.set(0.0)
+                        self._job = self.after(SAMPLE_INTERVAL_MS, self._tick_monitor)
+                        return
+                elif not self._accel_warned:
+                    self._accel_warned = True
+                    self.app._append_log(
+                        f"加速度读数 {magnitude:.2f}g 不在合理范围，本次校准只按陀螺仪判断静止"
+                    )
             self._samples.append(tuple(state.gyro))
             if len(self._samples) > WINDOW_SAMPLES:
                 self._samples.pop(0)

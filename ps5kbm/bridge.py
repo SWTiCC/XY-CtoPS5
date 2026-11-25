@@ -215,75 +215,13 @@ _install_diagnostics()
 # ---------------------------------------------------------------- 主机反馈
 # 主机下发震动 / 自适应扳机走 Takion DATA 块的 data_type（7=震动，11=扳机效果）。
 # pyremoteplay 解析这块时会丢掉 data_type，这里补一层，把数据分出来。
-_audio_flag_file = None
-_audio_flag_count = 0
-
-
-def _capture_audio_flag(msg: bytes, header_end: int) -> None:
-    """记录每个音频包的长度和 haptics 标记字节（上限 3000 条）。"""
-    global _audio_flag_file, _audio_flag_count
-    if _audio_flag_count >= 3000:
-        return
-    try:
-        import json
-        import os
-
-        if _audio_flag_file is None:
-            path = os.path.join(os.getcwd(), "tests", "_tmp", "audio_flags.jsonl")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            _audio_flag_file = open(path, "w", encoding="utf-8")
-        _audio_flag_file.write(
-            json.dumps(
-                {"t": round(time.time(), 4), "len": len(msg), "flag": msg[header_end]},
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        _audio_flag_file.flush()
-        _audio_flag_count += 1
-    except Exception:  # noqa: BLE001
-        pass
-
-
-def _capture_haptics_packet(pcm: bytes) -> None:
-    """把触觉包（解密后）写成 jsonl，用于离线分析包节奏。"""
-    global _haptics_capture_file, _haptics_capture_count
-    if _haptics_capture_count >= _haptics_capture_limit:
-        return
-    try:
-        import json
-        import os
-
-        if _haptics_capture_file is None:
-            path = os.path.join(os.getcwd(), "tests", "_tmp", "haptics_capture.jsonl")
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-            _haptics_capture_file = open(path, "w", encoding="utf-8")
-            _LOGGER.info("触觉抓包开始：%s", path)
-        _haptics_capture_file.write(
-            json.dumps(
-                {"t": round(time.time(), 4), "len": len(pcm), "hex": pcm.hex()},
-                ensure_ascii=False,
-            )
-            + "\n"
-        )
-        _haptics_capture_file.flush()
-        _haptics_capture_count += 1
-    except Exception:  # noqa: BLE001 - 抓包失败不影响主流程
-        pass
-
-
-_feedback_handlers = {"rumble": None, "trigger": None, "haptics": None}
+_feedback_handlers = {"rumble": None, "trigger": None, "haptics": None, "led": None}
 _haptics_pcm_callback = None
-_haptics_capture_file = None
-_haptics_capture_count = 0
-_haptics_capture_limit = 2000
-# 调试用：抓包落盘（发布版关闭）
-_HAPTICS_DEBUG = False
 _feedback_counts = {"rumble": 0, "trigger": 0}
 _data_type_counts: dict[int, int] = {}
 
 
-def set_feedback_handlers(rumble_cb, trigger_cb, haptics_cb=None) -> None:
+def set_feedback_handlers(rumble_cb, trigger_cb, haptics_cb=None, led_cb=None) -> None:
     """注册主机反馈回调。
 
     rumble_cb(left: float, right: float)：0~1；
@@ -292,6 +230,7 @@ def set_feedback_handlers(rumble_cb, trigger_cb, haptics_cb=None) -> None:
     _feedback_handlers["rumble"] = rumble_cb
     _feedback_handlers["trigger"] = trigger_cb
     _feedback_handlers["haptics"] = haptics_cb
+    _feedback_handlers["led"] = led_cb
 
 
 def _dispatch_feedback(kind: str, body: bytes) -> None:
@@ -318,6 +257,14 @@ def _dispatch_feedback(kind: str, body: bytes) -> None:
                     handler(body[1] / 255.0, body[2] / 255.0)
                 except Exception:  # noqa: BLE001
                     pass
+    elif kind == "led":
+        parsed = feedback.parse_pad_info(body)
+        handler = _feedback_handlers["led"]
+        if parsed and handler and any(parsed["led"]):
+            try:
+                handler(parsed["led"])
+            except Exception:  # noqa: BLE001
+                pass
     elif kind == "trigger":
         parsed = feedback.parse_trigger_effects(body)
         handler = _feedback_handlers["trigger"]
@@ -350,6 +297,8 @@ def _patch_takion_feedback() -> None:
                     _dispatch_feedback("rumble", bytes(payload[9:]))
                 elif data_type == feedback.DATA_TYPE_TRIGGER_EFFECTS:
                     _dispatch_feedback("trigger", bytes(payload[9:]))
+                elif data_type == feedback.DATA_TYPE_PAD_INFO:
+                    _dispatch_feedback("led", bytes(payload[9:]))
                 elif data_type != feedback.DATA_TYPE_PROTOBUF:
                     # 其它类型（比如 pad info）：先记录下来，方便后续接入
                     if _DIAGNOSTICS["enabled"]:
@@ -396,21 +345,39 @@ def _patch_haptics_audio() -> None:
                 session = getattr(self, "_session", None)
                 host_type = getattr(session, "type", TYPE_PS5) or TYPE_PS5
                 if cipher is not None and host_type == TYPE_PS5 and len(msg) > 24:
-                    # chiaki 的 v12 音频头：base(1) + 0x11 + 1 = 19；
-                    # 有 NALU 信息结构时再 +3。之前这里多算了 1 字节，
-                    # 读到的“标记”其实是音频数据，触觉包几乎全被漏掉。
+                    # v12 音频头：base(1) + 0x11 + 1 = 19；有 NALU 信息结构时再 +3。
+                    # 之前这里多算了 1 字节，读到的“标记”其实是音频数据，触觉包几乎全被漏掉。
                     header_end = 1 + 0x11 + 1
                     # NALU 标志在 base type 字节（msg[0]）的高 4 位，不是 msg[1]
                     if (msg[0] >> 4) & 1:
                         header_end += 3
-                    if _HAPTICS_DEBUG:
-                        _capture_audio_flag(msg, header_end)
-                    if msg[header_end] == 0x02:  # haptics 包（chiaki 定义）
+                    if msg[header_end] == 0x02:  # 触觉帧标记
+                        # 触觉单元是原始 PCM（3kHz 立体声 s16），不做解码。
+                        # 音频帧里还带冗余（FEC）单元，它们不是有效音频，按单元数跳过：
+                        # unit_index >= src 单元数的就是 FEC。
+                        dword2 = int.from_bytes(msg[5:9], "big")
+                        unit_index = (dword2 >> 24) & 0xFF
+                        src_units = dword2 & 0x0F
+                        fec_units = (dword2 >> 4) & 0x0F
+                        if fec_units and src_units and unit_index >= src_units:
+                            _note_haptics_skip()
+                            return original(self, msg)
                         key_pos = int.from_bytes(msg[14:18], "big")
-                        pcm = cipher.decrypt(bytes(msg[header_end + 1 :]), key_pos)
-                        if _HAPTICS_DEBUG:
-                            _capture_haptics_packet(pcm)
-                        # 只在收包线程排队，解码放独立线程，绝不拖慢输入
+                        frame_index = int.from_bytes(msg[3:5], "big")
+                        raw = cipher.decrypt(bytes(msg[header_end + 1 :]), key_pos)
+                        # 一个包里可能带多个单元：只有前 src_units 个是真实音频，
+                        # 后面的是 FEC 校验。再按帧序号去重（重复包/乱序旧帧丢掉）。
+                        pcm, total_units, src_units_in_packet, fec_units = (
+                            feedback.audio_units(raw, dword2)
+                        )
+                        if src_units_in_packet and total_units > 1:
+                            _note_units_trimmed(len(msg), len(pcm))
+                        pcm = _take_fresh_haptic_frames(raw, dword2, frame_index)
+                        if not pcm:
+                            # 重复包 / 乱序旧帧：这一帧已经播过，不重复播
+                            _note_haptics_stale()
+                            return original(self, msg)
+                        # 只在收包线程排队，写手柄放独立线程，绝不拖慢输入
                         _ensure_haptics_worker()
                         try:
                             _haptics_queue.put_nowait(pcm)
@@ -424,27 +391,93 @@ def _patch_haptics_audio() -> None:
     RPStream._ps5kbm_haptics_patched = True  # type: ignore[attr-defined]
 
 
-_haptics_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=64)
+_haptics_skipped = 0
+
+
+def _note_haptics_skip() -> None:
+    """记一次 FEC 冗余单元跳过（只记首条，避免刷日志）。"""
+    global _haptics_skipped
+    _haptics_skipped += 1
+    if _haptics_skipped == 1:
+        _LOGGER.debug("触觉流：开始跳过 FEC 冗余单元")
+
+
+_units_trimmed = 0
+
+
+def _note_units_trimmed(packet_bytes: int, pcm_bytes: int) -> None:
+    """记一次「一个包只取真实音频单元」（只记首条，避免刷日志）。"""
+    global _units_trimmed
+    _units_trimmed += 1
+    if _units_trimmed == 1:
+        _LOGGER.info(
+            "触觉流：已丢弃包内的冗余校验单元，每包只写真实音频（%d → %d 字节）",
+            packet_bytes,
+            pcm_bytes,
+        )
+
+
+# 触觉包现在每包约 10ms（1 个单位 120 字节），队列留 16 个（≈160ms）：
+# 界面线程偶发抢占 GIL 时宁愿晚一点播，也别在这里把包丢掉（丢包就是缺音频，
+# 回调饿死一次就听感断续）。
+_haptics_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=16)
 _haptics_thread = None
+
+# 上一次交给手柄的触觉帧序号（16 位环形）。照 chiaki 的 haptics 规则去重：
+# 只有比上一帧新的才播，重复包/乱序旧帧直接丢。
+_haptics_last_frame: int | None = None
+_haptics_stale = 0
+
+
+def _seq16_gt(a: int, b: int) -> bool:
+    """16 位环形序号比较：a 是否比 b 新（对应 chiaki_seq_num_16_gt）。"""
+    return 0 < ((a - b) & 0xFFFF) < 0x8000
+
+
+def _take_fresh_haptic_frames(raw: bytes, dword2: int, frame_index: int) -> bytes:
+    """按 chiaki 的 audioreceiver 规则，只保留「比上一帧新」的真实音频单元。
+
+    触觉包和普通音频共用一条 AV 帧序号。chiaki 处理 haptics 帧只做一件事：
+    `if(frame_index > prev) deliver` —— 网络重传、重复包、乱序旧帧都会被丢掉。
+    我们之前把每包解码结果直接排队，等于同一段触觉可能播两遍、旧帧晚到还会插到
+    新帧后面；手感上就是「不该震的时候震一下」「连续不规则间断」。
+    """
+    global _haptics_last_frame
+    unit_size = (dword2 & 0xFFFF) >> 8
+    src = dword2 & 0x0F
+    if unit_size <= 0 or src <= 0:
+        return raw
+    fresh = bytearray()
+    for i in range(src):
+        index = (frame_index + i) & 0xFFFF
+        if _haptics_last_frame is not None and not _seq16_gt(
+            index, _haptics_last_frame
+        ):
+            continue
+        _haptics_last_frame = index
+        start = unit_size * i
+        if start + unit_size <= len(raw):
+            fresh += raw[start : start + unit_size]
+    return bytes(fresh)
+
+
+def _note_haptics_stale() -> None:
+    """记一次重复/乱序帧被丢掉（只记首条，避免刷日志）。"""
+    global _haptics_stale
+    _haptics_stale += 1
+    if _haptics_stale == 1:
+        _LOGGER.info("触觉流：已开始丢弃重复/乱序的旧帧")
 
 
 def reset_haptics() -> None:
     """新会话开始时清掉解码器状态和积压包。"""
-    global _opus_decoder, _opus_errors, _haptics_capture_file, _haptics_capture_count
-    _opus_decoder = None
-    _opus_errors = 0
+    global _haptics_last_frame
     try:
         while True:
             _haptics_queue.get_nowait()
     except queue.Empty:
         pass
-    if _haptics_capture_file is not None:
-        try:
-            _haptics_capture_file.close()
-        except Exception:  # noqa: BLE001
-            pass
-    _haptics_capture_file = None
-    _haptics_capture_count = 0
+    _haptics_last_frame = None
 
 
 def set_haptics_pcm_handler(callback) -> None:
@@ -465,103 +498,24 @@ def _ensure_haptics_worker() -> None:
 
 
 def _haptics_worker() -> None:
-    """解码触觉包 → PCM，交给 app 写到 DualSense 音频端点。"""
+    """把触觉 PCM 直接交给 app（写 DualSense 音频端点）。
+
+    触觉包是**原始 PCM**（3kHz 立体声 s16），不是 Opus——
+    chiaki 的 haptics sink 和参考实现都是直接把它当 PCM 用，
+    之前我们多做了一次 Opus 解码，解出来的自然是噪声。
+    """
     while True:
-        data = _haptics_queue.get()
+        pcm = _haptics_queue.get()
+        callback = _haptics_pcm_callback
+        if not callback or not pcm:
+            continue
         try:
-            pcm = _decode_haptics(data)
+            callback(pcm)
         except Exception:  # noqa: BLE001 - 单包失败不影响后续
-            pcm = None
-        if pcm:
-            callback = _haptics_pcm_callback
-            if callback:
-                try:
-                    callback(pcm)
-                except Exception:  # noqa: BLE001
-                    pass
+            pass
 
 
-_opus_decoder = None
-_opus_frames_logged = 0
-_opus_errors = 0
-
-
-def _decode_haptics(data: bytes) -> bytes | None:
-    """Opus 解码触觉包，返回 48k 立体声 s16 交错 PCM；失败返回 None。"""
-    global _opus_decoder, _opus_frames_logged, _opus_errors
-    try:
-        import av
-    except Exception as exc:  # noqa: BLE001
-        _opus_errors += 1
-        if _opus_errors <= 3:
-            _LOGGER.warning("触觉音频解码不可用（缺少 av）：%s", exc)
-        return None
-    try:
-        if _opus_decoder is None:
-            _opus_decoder = av.CodecContext.create("opus", "r")
-        frames = _opus_decoder.decode(av.Packet(data))
-    except Exception as exc:  # noqa: BLE001
-        _opus_errors += 1
-        if _opus_errors <= 3:
-            _LOGGER.warning("触觉音频解码失败：%s", exc)
-        return None
-    if not frames:
-        return None
-    if _opus_frames_logged < 3:
-        frame = frames[0]
-        _opus_frames_logged += 1
-        _LOGGER.debug(
-            "触觉音频解码成功：format=%s rate=%s channels=%s samples=%s",
-            frame.format.name,
-            frame.sample_rate,
-            frame.layout.name,
-            frame.samples,
-        )
-    chunks = [_frame_to_stereo_s16(frame) for frame in frames]
-    pcm = b"".join(chunk for chunk in chunks if chunk)
-    return pcm or None
-
-
-def _frame_to_stereo_s16(frame) -> bytes:
-    """把一帧音频转成 48k 立体声 s16 交错字节。"""
-    import array
-    import struct
-
-    name = frame.format.name
-    try:
-        planes = [bytes(plane) for plane in frame.planes]
-    except Exception:  # noqa: BLE001
-        return b""
-    if name.startswith("flt") or name.startswith("dbl"):
-        fmt = "f" if name.startswith("flt") else "d"
-        size = 4 if fmt == "f" else 8
-        def read(raw):
-            usable = len(raw) - (len(raw) % size)
-            return [value * 32767 for value in struct.unpack(f"<{usable // size}{fmt}", raw[:usable])]
-    elif name.startswith("s16") or name in ("s16", "s16p"):
-        def read(raw):
-            usable = len(raw) - (len(raw) % 2)
-            return list(array.array("h", raw[:usable]))
-    else:
-        return b""
-    if name.endswith("p") and len(planes) >= 2:
-        left = read(planes[0])
-        right = read(planes[1])
-    elif name.endswith("p"):
-        left = right = read(planes[0])
-    else:
-        values = read(planes[0])
-        left = values[0::2]
-        right = values[1::2]
-    count = min(len(left), len(right))
-    output = array.array("h", bytes(count * 4))
-    for index in range(count):
-        output[2 * index] = max(-32768, min(32767, int(left[index])))
-        output[2 * index + 1] = max(-32768, min(32767, int(right[index])))
-    return output.tobytes()
-
-
-# 触觉音频解析（开关由配置 controller.haptics_rumble 控制，默认关）
+# 触觉音频解析：解析出 PCM 后交给 app，由 app 判断（USB 连接 + 开关打开）是否写手柄
 ENABLE_HAPTICS_AUDIO = True
 if ENABLE_HAPTICS_AUDIO:
     _patch_haptics_audio()

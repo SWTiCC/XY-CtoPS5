@@ -204,7 +204,7 @@ class ControllerConfig:
     gyro: GyroConfig = field(default_factory=GyroConfig)
     rumble_enabled: bool = True
     # USB 连接时的原生触觉（写入 DualSense 音频端点 3/4 声道）
-    haptics_usb: bool = False
+    haptics_usb: bool = True
     rumble_gain: float = 1.0
     adaptive_triggers: bool = True
 
@@ -509,7 +509,7 @@ def _build_controller(raw: dict) -> ControllerConfig:
         mode=mode,
         gyro=_build_gyro(raw.get("gyro") or {}),
         rumble_enabled=bool(raw.get("rumble_enabled", True)),
-        haptics_usb=bool(raw.get("haptics_usb", False)),
+        haptics_usb=bool(raw.get("haptics_usb", True)),
         rumble_gain=_clamp(raw.get("rumble_gain", 1.0), 0.0, 2.0, 1.0),
         adaptive_triggers=bool(raw.get("adaptive_triggers", True)),
     )

@@ -181,6 +181,17 @@ class InputSource:
     def listening(self) -> bool:
         return self._listening
 
+    @property
+    def raw_mouse_ok(self) -> bool:
+        """Raw Input 鼠标是否在工作（诊断用）。"""
+        return self._raw_mouse_ok
+
+    def raw_mouse_stats(self) -> tuple[int, int]:
+        """(WM_INPUT 帧数, 累计位移)，取走后清零（诊断用）。"""
+        if not self._raw_mouse_ok:
+            return 0, 0
+        return self._raw_mouse.stats()
+
     def set_capture_callback(self, callback) -> None:
         self._on_capture_changed = callback
 
@@ -238,8 +249,9 @@ class InputSource:
         """取本帧鼠标位移。
 
         优先用 Raw Input 的设备相对位移（本地鼠标最准）。
-        远程桌面（ToDesk 等）的注入往往不产生 WM_INPUT，此时退回用
-        光标位置差值——ToDesk 直接设置光标坐标，前后差值就是真实移动。
+        **Raw Input 这一帧没出数时，退回用光标位置差值**——远程桌面（ToDesk / RDP）
+        的注入常常根本不产生 WM_INPUT，之前把光标基准无条件更新了，兜底永远算出 0，
+        等于这条退路是死的（表现就是"鼠标拖动画面不动"）。
         """
         point = wintypes.POINT()
         has_point = bool(user32.GetCursorPos(ctypes.byref(point)))
@@ -249,10 +261,11 @@ class InputSource:
                 dx, dy = self._raw_dx, self._raw_dy
                 self._raw_dx = 0
                 self._raw_dy = 0
-                if has_point:
-                    # 同步光标基准，避免下一帧把同一段移动再算一次
-                    self._cursor_last = (point.x, point.y)
             if dx or dy:
+                if has_point:
+                    # 有 Raw 数据时同步光标基准，避免同一段移动被算两次
+                    with self._lock:
+                        self._cursor_last = (point.x, point.y)
                 return int(dx), int(dy)
 
         if not has_point:

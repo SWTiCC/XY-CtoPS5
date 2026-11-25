@@ -250,7 +250,7 @@ def build_controller_page(app, parent) -> ctk.CTkFrame:
 
     # ---------------------------------------------------------- 震动 / 扳机
     feedback_card = build_card(
-        page, "震动与自适应扳机", "USB 连接：震动（实验性）+ 自适应扳机；蓝牙：仅自适应扳机"
+        page, "震动与自适应扳机", "震动三选一：音频触觉（USB 独占）/ 经典马达 / 关闭；自适应扳机 USB·蓝牙都可用"
     )
     feedback_card.pack(fill="x")
     fb_inner = ctk.CTkFrame(feedback_card, fg_color="transparent")
@@ -258,10 +258,27 @@ def build_controller_page(app, parent) -> ctk.CTkFrame:
 
     rumble_row = ctk.CTkFrame(fb_inner, fg_color="transparent")
     rumble_row.pack(fill="x")
-    app._rumble_var = tk.BooleanVar(value=app._config.controller.rumble_enabled)
-    switch(rumble_row, "震动转发", app._rumble_var, app._toggle_rumble).pack(side="left")
+    # 音频触觉和经典马达互斥（马达使能位会让音频触觉静音），所以只给一个选择器
     ctk.CTkLabel(
-        rumble_row, text="强度", font=font(T.XS), text_color=T.TEXT_DIM
+        rumble_row, text="震动方式", font=font(T.SM), text_color=T.TEXT_DIM
+    ).pack(side="left", padx=(0, T.S2))
+    app._vibration_mode_var = tk.StringVar(value=app.vibration_mode_label())
+    ctk.CTkOptionMenu(
+        rumble_row,
+        variable=app._vibration_mode_var,
+        values=list(app.VIBRATION_MODE_LABELS),
+        command=app.set_vibration_mode,
+        width=150,
+        height=28,
+        corner_radius=T.R_SM,
+        fg_color=T.SURFACE_HOVER,
+        button_color=T.SURFACE_HOVER,
+        button_hover_color=T.BORDER,
+        text_color=T.TEXT,
+        font=font(T.XS),
+    ).pack(side="left")
+    ctk.CTkLabel(
+        rumble_row, text="强度（马达）", font=font(T.XS), text_color=T.TEXT_DIM
     ).pack(side="left", padx=(T.S4, T.S2))
     app._rumble_gain_label = _slider_cell(
         app,
@@ -271,16 +288,21 @@ def build_controller_page(app, parent) -> ctk.CTkFrame:
         0.0,
         2.0,
         app._apply_rumble_gain,
-        width=120,
+        width=110,
         horizontal=True,
-    )
-    app._haptics_var = tk.BooleanVar(value=app._config.controller.haptics_usb)
-    switch(rumble_row, "USB 震动（实验）", app._haptics_var, app._toggle_haptics_usb).pack(
-        side="right", padx=T.S2
     )
     secondary_button(rumble_row, "试一下", app.test_rumble, width=72, height=28).pack(
         side="right"
     )
+    app._vibration_hint = ctk.CTkLabel(
+        fb_inner,
+        text=app.vibration_hint_text(),
+        font=font(T.XS),
+        text_color=T.TEXT_FAINT,
+        anchor="w",
+        justify="left",
+    )
+    app._vibration_hint.pack(fill="x", pady=(T.S1, 0))
 
     trigger_row = ctk.CTkFrame(fb_inner, fg_color="transparent")
     trigger_row.pack(fill="x", pady=(T.S2, 0))
@@ -392,6 +414,10 @@ def refresh(app) -> None:
     """按手柄状态刷新页面（由 app 的轮询调用）。"""
     state = app.controller_snapshot()
     connected = state is not None
+    hint = app.vibration_hint_text()
+    if getattr(app, "_vibration_hint_text", None) != hint:
+        app._vibration_hint_text = hint
+        app._vibration_hint.configure(text=hint)
     if connected:
         app._controller_dot.configure(text_color=T.OK)
         # 电量直接写在状态行里，进手柄页第一眼就能看到

@@ -86,3 +86,31 @@ def activate_by_title(title_keyword: str, exclude: str = "") -> bool:
     if hwnd is None:
         return False
     return activate_window(hwnd)
+
+
+# 单实例互斥体句柄：必须一直持有，否则互斥体会被系统释放
+_instance_mutex = None
+_ERROR_ALREADY_EXISTS = 183
+
+
+def acquire_single_instance(name: str = "XY-CtoPS5") -> bool:
+    """命名互斥体做单实例保护；已有实例在跑返回 False。
+
+    两个实例同时跑会抢同一个 DualSense 的 HID 句柄，还会互相覆盖 config.json，
+    所以第二次启动只提示一下然后退出。创建失败时不拦（宁可多开也别打不开）。
+    """
+    global _instance_mutex
+    if _instance_mutex is not None:
+        return True
+    try:
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+        handle = kernel32.CreateMutexW(None, False, f"Local\\{name}")
+    except Exception as exc:  # noqa: BLE001 - 拿不到互斥体就不做保护
+        _LOGGER.debug("单实例互斥体创建失败：%s", exc)
+        return True
+    if not handle:
+        return True
+    _instance_mutex = handle
+    return kernel32.GetLastError() != _ERROR_ALREADY_EXISTS
