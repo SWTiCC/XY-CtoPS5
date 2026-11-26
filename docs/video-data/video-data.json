@@ -1,0 +1,765 @@
+{
+  "meta": {
+    "project": "XY-CtoPS5",
+    "title": "XY-CtoPS5 v0.3 教程片",
+    "sourceEngine": "Remotion 4.0.484（React + TypeScript）",
+    "width": 1920,
+    "height": 1080,
+    "fps": 30,
+    "totalFrames": 6232,
+    "totalSeconds": 207.73,
+    "timecode": "03:27:22",
+    "timecodeFormat": "mm:ss:ff（分:秒:帧）",
+    "exportedAt": "2026-11-26T12:28:33.477Z",
+    "note": "所有 absPath 为本机绝对路径；坐标 x/y/w/h 是相对截图的 0–1 比例"
+  },
+  "palette": {
+    "void": "#03050a",
+    "text": "#eef4ff",
+    "dim": "#7f92ad",
+    "cyan": "#38e1ff",
+    "blue": "#4d8dff",
+    "purple": "#a06bff",
+    "gold": "#ffc46b"
+  },
+  "fonts": {
+    "sans": "\"Microsoft YaHei\", \"Noto Sans SC\", sans-serif",
+    "mono": "\"Cascadia Mono\", \"Consolas\", monospace"
+  },
+  "screenshotWindow": {
+    "x": 520,
+    "y": 72,
+    "w": 1120,
+    "h": 933
+  },
+  "scenes": [
+    {
+      "index": 1,
+      "key": "intro",
+      "from": 0,
+      "duration": 360,
+      "to": 360,
+      "audio": "voice/01_intro.mp3",
+      "kind": "brand-open",
+      "component": "SceneIntro",
+      "motionNote": "刻度环匀速旋转；标题「模糊聚焦 + 字距 70→6 收拢」揭示，外发光呼吸；两个玩法 pill 依次 spring 弹入"
+    },
+    {
+      "index": 2,
+      "key": "diagram",
+      "from": 360,
+      "duration": 335,
+      "to": 695,
+      "audio": "voice/02_diagram.mp3",
+      "kind": "diagram",
+      "component": "SceneDiagram",
+      "motionNote": "6 个节点 spring 入场（perspective rotateX 22°→0 + 上浮）；连线路径生长；亮色数据包沿连线循环跑动；标签淡入"
+    },
+    {
+      "index": 3,
+      "key": "modes",
+      "from": 695,
+      "duration": 515,
+      "to": 1210,
+      "audio": "voice/03_modes.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotModes",
+      "image": "images/connect-quick-v3.png",
+      "title": "先选玩法",
+      "subtitle": "连接页顶部切换；连接之后要改，需要先断开",
+      "signal": 1,
+      "targets": [
+        {
+          "x": 0.272,
+          "y": 0.143,
+          "w": 0.695,
+          "h": 0.07,
+          "head": "MODE",
+          "detail": "玩法：键鼠 / 手柄"
+        }
+      ],
+      "motionNote": "扫描线匀速下扫，越过目标下缘时 L 形取景框从外扩 54px 弹簧收拢（过冲）+ 对焦闪；左栏说明逐字打出"
+    },
+    {
+      "index": 4,
+      "key": "connect1",
+      "from": 1210,
+      "duration": 482,
+      "to": 1692,
+      "audio": "voice/06_connect.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotConnect1",
+      "image": "images/connect-unpaired-v3.png",
+      "title": "第一次配对",
+      "subtitle": "PSN Account ID 与 PS5 上显示的 8 位 PIN",
+      "signal": 2,
+      "targets": [
+        {
+          "x": 0.273,
+          "y": 0.289,
+          "w": 0.36,
+          "h": 0.07,
+          "head": "HOST",
+          "detail": "填 IP 或扫描局域网"
+        },
+        {
+          "x": 0.273,
+          "y": 0.587,
+          "w": 0.5,
+          "h": 0.148,
+          "head": "PAIR",
+          "detail": "Account ID + 8 位 PIN"
+        }
+      ],
+      "motionNote": "同上，两个目标按扫描顺序依次咬合，编号 01/02"
+    },
+    {
+      "index": 5,
+      "key": "connect2",
+      "from": 1692,
+      "duration": 656,
+      "to": 2348,
+      "audio": "voice/07_connect2.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotConnect2",
+      "image": "images/connect-quick-v3.png",
+      "title": "已配对直接连",
+      "subtitle": "凭据已保存；IP 变了也能按主机身份自动找回",
+      "signal": 3,
+      "targets": [
+        {
+          "x": 0.27,
+          "y": 0.324,
+          "w": 0.696,
+          "h": 0.205,
+          "head": "PAIRED",
+          "detail": "已配对在线 → 直接连接"
+        }
+      ],
+      "motionNote": "同上，单目标；扫描结束扫描线淡出，画面靠极缓推镜维持"
+    },
+    {
+      "index": 6,
+      "key": "mapping1",
+      "from": 2348,
+      "duration": 474,
+      "to": 2822,
+      "audio": "voice/08_mapping.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotMapping1",
+      "image": "images/mapping-page-v3.png",
+      "title": "预设与模式",
+      "subtitle": "选中即生效；一个预设内部可以有多套模式",
+      "signal": 4,
+      "targets": [
+        {
+          "x": 0.273,
+          "y": 0.254,
+          "w": 0.6,
+          "h": 0.05,
+          "head": "PRESET",
+          "detail": "预设 = 一整套按键"
+        },
+        {
+          "x": 0.273,
+          "y": 0.314,
+          "w": 0.6,
+          "h": 0.052,
+          "head": "MODE",
+          "detail": "模式用切换键循环"
+        }
+      ],
+      "motionNote": "同上，两个目标（预设行 / 编辑模式行）间距小，需确认两枚徽章不重叠"
+    },
+    {
+      "index": 7,
+      "key": "mapping2",
+      "from": 2822,
+      "duration": 636,
+      "to": 3458,
+      "audio": "voice/09_mapping2.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotMapping2",
+      "image": "images/mapping-page-v3.png",
+      "title": "按键列表",
+      "subtitle": "支持单按钮、组合键与序列宏",
+      "signal": 5,
+      "targets": [
+        {
+          "x": 0.291,
+          "y": 0.498,
+          "w": 0.56,
+          "h": 0.148,
+          "head": "BIND",
+          "detail": "改键 / 编辑 / 删除"
+        },
+        {
+          "x": 0.273,
+          "y": 0.722,
+          "w": 0.6,
+          "h": 0.052,
+          "head": "STICK",
+          "detail": "左摇杆方向键单独编辑"
+        }
+      ],
+      "motionNote": "同上，两个目标（按键列表 / 左摇杆行）"
+    },
+    {
+      "index": 8,
+      "key": "controller",
+      "from": 3458,
+      "duration": 450,
+      "to": 3908,
+      "audio": "voice/08_controller.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotController",
+      "image": "images/controller-page.png",
+      "title": "手柄玩法",
+      "subtitle": "USB 或蓝牙接到电脑；PS5 仍在连接页建立会话",
+      "signal": 6,
+      "targets": [
+        {
+          "x": 0.277,
+          "y": 0.467,
+          "w": 0.709,
+          "h": 0.257,
+          "head": "GYRO",
+          "detail": "陀螺仪 → 右摇杆"
+        },
+        {
+          "x": 0.277,
+          "y": 0.766,
+          "w": 0.6,
+          "h": 0.17,
+          "head": "RUMBLE",
+          "detail": "震动转发 · 自适应扳机"
+        }
+      ],
+      "motionNote": "同上，两个目标（陀螺仪卡片 / 震动扳机卡片），第二个 bbox 较高需要徽章沿高度居中"
+    },
+    {
+      "index": 9,
+      "key": "run1",
+      "from": 3908,
+      "duration": 548,
+      "to": 4456,
+      "audio": "voice/10_run.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotRun1",
+      "image": "images/run-page-v3.png",
+      "title": "开始捕获",
+      "subtitle": "先选窗口再开始捕获；捕获后指针隐藏",
+      "signal": 7,
+      "targets": [
+        {
+          "x": 0.285,
+          "y": 0.25,
+          "w": 0.4,
+          "h": 0.052,
+          "head": "CAPTURE",
+          "detail": "开始捕获 / F8"
+        },
+        {
+          "x": 0.266,
+          "y": 0.72,
+          "w": 0.706,
+          "h": 0.051,
+          "head": "WINDOW",
+          "detail": "捕获时切到的窗口"
+        }
+      ],
+      "motionNote": "同上，两个目标（开始捕获工具行 / 捕获窗口行）"
+    },
+    {
+      "index": 10,
+      "key": "run2",
+      "from": 4456,
+      "duration": 468,
+      "to": 4924,
+      "audio": "voice/11_run2.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotRun2",
+      "image": "images/run-page-v3.png",
+      "title": "鼠标手感",
+      "subtitle": "拖动即时生效，松手自动保存",
+      "signal": 8,
+      "targets": [
+        {
+          "x": 0.263,
+          "y": 0.4,
+          "w": 0.688,
+          "h": 0.196,
+          "head": "AIM",
+          "detail": "死区 · 灵敏度 · 平滑 · 反死区"
+        }
+      ],
+      "motionNote": "同上，单目标（手感滑条区）"
+    },
+    {
+      "index": 11,
+      "key": "run3",
+      "from": 4924,
+      "duration": 378,
+      "to": 5302,
+      "audio": "voice/12_run3.mp3",
+      "kind": "screenshot-scan",
+      "component": "ShotRun3",
+      "image": "images/run-page-v3.png",
+      "title": "扳机深度",
+      "subtitle": "设定按下时输出多深；捕获中用滚轮加深 / 减浅",
+      "signal": 9,
+      "targets": [
+        {
+          "x": 0.263,
+          "y": 0.592,
+          "w": 0.568,
+          "h": 0.098,
+          "head": "TRIGGER",
+          "detail": "R2 / L2 深度 · 滚轮调"
+        }
+      ],
+      "motionNote": "同上，单目标（扳机深度行）"
+    },
+    {
+      "index": 12,
+      "key": "gta6a",
+      "from": 5302,
+      "duration": 320,
+      "to": 5622,
+      "audio": "voice/12_gta6_1.mp3",
+      "kind": "full-image",
+      "component": "FullImageShot",
+      "image": "images/推荐1.png",
+      "title": "灵敏度",
+      "sub": "瞄准与视角灵敏度全部 14 · 响应曲线线性",
+      "motionNote": "整图 spring 入（scale 0.97→1），全程 1.00→1.05 极缓推近；标题与说明淡入；图片外框金色发光"
+    },
+    {
+      "index": 13,
+      "key": "gta6b",
+      "from": 5622,
+      "duration": 320,
+      "to": 5942,
+      "audio": "voice/13_gta6_2.mp3",
+      "kind": "full-image",
+      "component": "FullImageShot",
+      "image": "images/推荐2.png",
+      "title": "战斗",
+      "sub": "自由瞄准 3/3 · 辅助瞄准 0 · 射击辅助关 · 驾驶辅助开",
+      "motionNote": "同 gta6a"
+    },
+    {
+      "index": 14,
+      "key": "outro",
+      "from": 5942,
+      "duration": 290,
+      "to": 6232,
+      "audio": "voice/05_outro.mp3",
+      "kind": "brand-close",
+      "component": "SceneOutro",
+      "motionNote": "刻度环旋转；标题弹入 + 缩放 0.9→1；三行信息依次淡入；片尾补 riser + impact 两个音效"
+    }
+  ],
+  "assets": {
+    "images": [
+      {
+        "file": "images/connect-quick-v3.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\connect-quick-v3.png",
+        "width": 1408,
+        "height": 1172,
+        "bytes": 78992,
+        "usedBy": [
+          "modes",
+          "connect2"
+        ]
+      },
+      {
+        "file": "images/connect-unpaired-v3.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\connect-unpaired-v3.png",
+        "width": 1409,
+        "height": 1171,
+        "bytes": 57273,
+        "usedBy": [
+          "connect1"
+        ]
+      },
+      {
+        "file": "images/mapping-page-v3.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\mapping-page-v3.png",
+        "width": 1409,
+        "height": 1171,
+        "bytes": 75143,
+        "usedBy": [
+          "mapping1",
+          "mapping2"
+        ]
+      },
+      {
+        "file": "images/controller-page.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\controller-page.png",
+        "width": 1390,
+        "height": 1185,
+        "bytes": 86447,
+        "usedBy": [
+          "controller"
+        ]
+      },
+      {
+        "file": "images/run-page-v3.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\run-page-v3.png",
+        "width": 1409,
+        "height": 1171,
+        "bytes": 80960,
+        "usedBy": [
+          "run1",
+          "run2",
+          "run3"
+        ]
+      },
+      {
+        "file": "images/推荐1.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\推荐1.png",
+        "width": 2166,
+        "height": 1506,
+        "bytes": 3952927,
+        "usedBy": [
+          "gta6a"
+        ]
+      },
+      {
+        "file": "images/推荐2.png",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\images\\推荐2.png",
+        "width": 2058,
+        "height": 1487,
+        "bytes": 3104230,
+        "usedBy": [
+          "gta6b"
+        ]
+      }
+    ],
+    "voice": [
+      {
+        "file": "voice/01_intro.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\01_intro.mp3",
+        "seconds": 10.872,
+        "frames": 327,
+        "bytes": 65232,
+        "text": "用键盘鼠标玩 PS5 游戏。XY-CtoPS5，开源免费。两种玩法：键鼠映射，或者 DualSense 手柄直通。",
+        "textMissing": false,
+        "textSource": "tts_v4.py",
+        "sceneKey": "intro"
+      },
+      {
+        "file": "voice/02_diagram.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\02_diagram.mp3",
+        "seconds": 10.032,
+        "frames": 301,
+        "bytes": 60192,
+        "text": "画面走采集卡的 HDMI 环出，几乎没有延迟；输入走远程游玩的输入通道，把键鼠伪装成一个虚拟手柄。",
+        "textMissing": false,
+        "textSource": "tts_edge.py",
+        "sceneKey": "diagram"
+      },
+      {
+        "file": "voice/03_modes.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\03_modes.mp3",
+        "seconds": 15.96,
+        "frames": 479,
+        "bytes": 95760,
+        "text": "打开程序第一件事，在连接页顶部选玩法。键盘：用键盘鼠标玩；手柄：把 DualSense 用 USB 或蓝牙接到电脑直通。注意连接之后需要更改则先断开再更改。",
+        "textMissing": false,
+        "textSource": "tts_v3.py",
+        "sceneKey": "modes"
+      },
+      {
+        "file": "voice/06_connect.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\06_connect.mp3",
+        "seconds": 14.88,
+        "frames": 447,
+        "bytes": 89280,
+        "text": "第一次使用，进连接页：填 PS5 的局域网 IP，也可以直接点扫描局域网，从列表里选。再填 PSN Account ID 和 PS5 屏幕上显示的八位 PIN，点配对。",
+        "textMissing": false,
+        "textSource": "tts_tutorial.py",
+        "sceneKey": "connect1"
+      },
+      {
+        "file": "voice/07_connect2.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\07_connect2.mp3",
+        "seconds": 20.64,
+        "frames": 620,
+        "bytes": 123840,
+        "text": "配对成功后，程序会记住这台主机。以后启动时自动检测它是否在线，只要在同一个网络里，点一下直接连接就能建立输入通道，不用再填任何东西。PS5 重启后 IP 变了也没关系，程序会按主机身份自动找回。",
+        "textMissing": false,
+        "textSource": "tts_tutorial.py",
+        "sceneKey": "connect2"
+      },
+      {
+        "file": "voice/08_mapping.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\08_mapping.mp3",
+        "seconds": 14.616,
+        "frames": 439,
+        "bytes": 87696,
+        "text": "映射页负责所有键位。最上面是预设，一套预设就是一套完整的按键方案，选中即生效。一个预设内部可以有多套模式，运行时用一个键循环切换。",
+        "textMissing": false,
+        "textSource": "tts_tutorial.py",
+        "sceneKey": "mapping1"
+      },
+      {
+        "file": "voice/09_mapping2.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\09_mapping2.mp3",
+        "seconds": 19.968,
+        "frames": 600,
+        "bytes": 119808,
+        "text": "每一条映射，左边是键，右边是手柄动作。可以改键、编辑、或者删除。除了单按钮，还支持组合键和序列宏。左摇杆的方向键在下面单独编辑，还能绑定幅度切换。所有改动都会即时自动保存。",
+        "textMissing": false,
+        "textSource": "tts_tutorial.py",
+        "sceneKey": "mapping2"
+      },
+      {
+        "file": "voice/08_controller.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\08_controller.mp3",
+        "seconds": 13.824,
+        "frames": 415,
+        "bytes": 82944,
+        "text": null,
+        "textMissing": true,
+        "textSuggested": "手柄玩法：把 DualSense 用 USB 或蓝牙接到电脑，PS5 的会话仍然在连接页建立。陀螺仪可以当右摇杆用，按住激活键就能微调视角；震动和自适应扳机也会转发到本地手柄。",
+        "textSource": null,
+        "sceneKey": "controller"
+      },
+      {
+        "file": "voice/10_run.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\10_run.mp3",
+        "seconds": 17.04,
+        "frames": 512,
+        "bytes": 102240,
+        "text": "进游戏之前来到运行页。注意顺序：先在下面选好捕获时要切到的窗口，再点开始捕获，或者直接按 F8。这样捕获一开始，画面窗口就会置顶，键鼠也完全交给 PS5。",
+        "textMissing": false,
+        "textSource": "tts_fix.py",
+        "sceneKey": "run1"
+      },
+      {
+        "file": "voice/11_run2.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\11_run2.mp3",
+        "seconds": 14.376,
+        "frames": 432,
+        "bytes": 86256,
+        "text": "这一屏是手感调节：过渡、死区、灵敏度、慢灵敏、快灵敏、平滑，拖动实时生效，松开自动保存。觉得小移动拖不动，就把反死区调大一点。",
+        "textMissing": false,
+        "textSource": "tts_tutorial.py",
+        "sceneKey": "run2"
+      },
+      {
+        "file": "voice/12_run3.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\12_run3.mp3",
+        "seconds": 11.376,
+        "frames": 342,
+        "bytes": 68256,
+        "text": "扳机深度：R2 和 L2 各有一个滑条，设定按下时输出多深；右边是加深、减浅键，捕获过程中用鼠标滚轮就能调。",
+        "textMissing": false,
+        "textSource": "tts_fix.py",
+        "sceneKey": "run3"
+      },
+      {
+        "file": "voice/12_gta6_1.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\12_gta6_1.mp3",
+        "seconds": 6.576,
+        "frames": 198,
+        "bytes": 39456,
+        "text": "GTA6 游戏内设置，瞄准与视角灵敏度，按这张图调整即可。",
+        "textMissing": false,
+        "textSource": "tts_v3.py",
+        "sceneKey": "gta6a"
+      },
+      {
+        "file": "voice/13_gta6_2.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\13_gta6_2.mp3",
+        "seconds": 6.648,
+        "frames": 200,
+        "bytes": 39888,
+        "text": "战斗设置同样按图调整。用鼠标精确瞄准，不需要辅助瞄准。",
+        "textMissing": false,
+        "textSource": "tts_v3.py",
+        "sceneKey": "gta6b"
+      },
+      {
+        "file": "voice/05_outro.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\voice\\05_outro.mp3",
+        "seconds": 7.08,
+        "frames": 213,
+        "bytes": 42480,
+        "text": "开源免费，在 GitHub 搜索 XY-CtoPS5。发行版只需一个安装程序。",
+        "textMissing": false,
+        "textSource": "tts_edge.py",
+        "sceneKey": "outro"
+      }
+    ],
+    "audio": [
+      {
+        "file": "public/audio/bgm-tech-house.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\bgm-tech-house.mp3",
+        "note": "背景音乐"
+      },
+      {
+        "file": "public/audio/click-camera.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\click-camera.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/impact-cine.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\impact-cine.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/keyboard.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\keyboard.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/pop.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\pop.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/riser-cine.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\riser-cine.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/sparkle.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\sparkle.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/swoosh-quick.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\swoosh-quick.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/transition-snap.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\transition-snap.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/transition-soft.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\transition-soft.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/whoosh-big.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\whoosh-big.mp3",
+        "note": "音效"
+      },
+      {
+        "file": "public/audio/whoosh-fast.mp3",
+        "absPath": "E:\\Code Project\\CtoPS5\\video\\public\\audio\\whoosh-fast.mp3",
+        "note": "音效"
+      }
+    ]
+  },
+  "sfxTimeline": [
+    {
+      "frame": 22,
+      "file": "impact-cine.mp3",
+      "volume": 0.5
+    },
+    {
+      "frame": 30,
+      "file": "sparkle.mp3",
+      "volume": 0.3
+    },
+    {
+      "frame": 356,
+      "file": "whoosh-fast.mp3",
+      "volume": 0.4,
+      "sceneKey": "diagram"
+    },
+    {
+      "frame": 691,
+      "file": "transition-snap.mp3",
+      "volume": 0.4,
+      "sceneKey": "modes"
+    },
+    {
+      "frame": 1206,
+      "file": "whoosh-big.mp3",
+      "volume": 0.38,
+      "sceneKey": "connect1"
+    },
+    {
+      "frame": 1688,
+      "file": "transition-soft.mp3",
+      "volume": 0.34,
+      "sceneKey": "connect2"
+    },
+    {
+      "frame": 2344,
+      "file": "whoosh-fast.mp3",
+      "volume": 0.38,
+      "sceneKey": "mapping1"
+    },
+    {
+      "frame": 2818,
+      "file": "transition-snap.mp3",
+      "volume": 0.38,
+      "sceneKey": "mapping2"
+    },
+    {
+      "frame": 3454,
+      "file": "whoosh-big.mp3",
+      "volume": 0.38,
+      "sceneKey": "controller"
+    },
+    {
+      "frame": 3904,
+      "file": "transition-soft.mp3",
+      "volume": 0.34,
+      "sceneKey": "run1"
+    },
+    {
+      "frame": 4452,
+      "file": "whoosh-fast.mp3",
+      "volume": 0.36,
+      "sceneKey": "run2"
+    },
+    {
+      "frame": 4920,
+      "file": "transition-soft.mp3",
+      "volume": 0.33,
+      "sceneKey": "run3"
+    },
+    {
+      "frame": 5298,
+      "file": "whoosh-big.mp3",
+      "volume": 0.42,
+      "sceneKey": "gta6a"
+    },
+    {
+      "frame": 5618,
+      "file": "whoosh-big.mp3",
+      "volume": 0.42,
+      "sceneKey": "gta6b"
+    },
+    {
+      "frame": 6032,
+      "file": "riser-cine.mp3",
+      "volume": 0.45,
+      "sceneKey": "outro"
+    },
+    {
+      "frame": 6102,
+      "file": "impact-cine.mp3",
+      "volume": 0.55,
+      "sceneKey": "outro"
+    }
+  ],
+  "timingRules": {
+    "durationRule": "每段 duration = 实测旁白帧数 + 余量（教程段 33~36 帧，GTA6 段 +120，结尾 +77）",
+    "probe": "audio.seconds × 30 向上取整 = 旁白占用的帧数",
+    "scanShot": {
+      "scanSpan": "clamp(duration × 0.55, 110, 300) 帧；扫描线严格匀速",
+      "trigger": "扫描线越过目标 bbox 下缘那一帧触发咬合；多点按下缘排序后钳制最小间隔 8 帧",
+      "textOnLeftPanel": "文字在左栏逐字打出（1.8 字/帧），窗内只留取景框 + 编号徽章"
+    }
+  }
+}
