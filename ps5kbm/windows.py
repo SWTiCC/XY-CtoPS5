@@ -13,8 +13,11 @@ from ctypes import wintypes
 _LOGGER = logging.getLogger(__name__)
 
 user32 = ctypes.windll.user32
+kernel32 = ctypes.windll.kernel32
 
 SW_RESTORE = 9
+VK_LBUTTON = 0x01
+VK_RBUTTON = 0x02
 _WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 
@@ -30,6 +33,15 @@ def _declare_api() -> None:
     user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    user32.GetAsyncKeyState.restype = ctypes.c_short
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.GetWindowThreadProcessId.argtypes = [
+        wintypes.HWND,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
 
 
 _declare_api()
@@ -86,6 +98,29 @@ def activate_by_title(title_keyword: str, exclude: str = "") -> bool:
     if hwnd is None:
         return False
     return activate_window(hwnd)
+
+
+def mouse_button_down() -> bool:
+    """用户此刻是否按着鼠标左键或右键。
+
+    低级钩子挡不住「改变激活窗口」对拖拽的破坏：拖动窗口 / 滑块的过程中，只要
+    有别的窗口被抢到前台，Windows 就会取消整次拖动，窗口弹回原位。所有会动焦点
+    的操作（覆盖层抢焦点、切目标窗口）动手前都先问一句这里。
+    """
+    for vk in (VK_LBUTTON, VK_RBUTTON):
+        if user32.GetAsyncKeyState(vk) & 0x8000:
+            return True
+    return False
+
+
+def foreground_is_ours() -> bool:
+    """前台窗口是不是本程序（本进程）的。没有前台窗口时返回 False。"""
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return False
+    process_id = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    return process_id.value == kernel32.GetCurrentProcessId()
 
 
 # 单实例互斥体句柄：必须一直持有，否则互斥体会被系统释放

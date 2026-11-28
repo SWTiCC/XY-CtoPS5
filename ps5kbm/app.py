@@ -18,7 +18,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from collections import Counter
+from collections import Counter, deque
 from tkinter import messagebox
 
 import customtkinter as ctk
@@ -33,9 +33,13 @@ from . import (
     gyro_calib_ui,
     haptics_usb,
     mapping_ui,
+    mode_signals,
     probe,
     run_tuning_ui,
     run_ui,
+    rule_editing,
+    rule_engine,
+    rules_ui,
     trigger_filter,
     ui_pages,
     windows,
@@ -55,6 +59,8 @@ from .ui_common import (
 )
 
 TICK_SECONDS = 1.0 / 250.0
+# 信号驱动模式切换的判定间隔：三类反馈数据的间隔都在 10~40ms，100ms 足够
+AUTO_SWITCH_TICK_MS = 100
 # 日志面板最多保留的行数：长时间挂着不会无限变长
 LOG_MAX_LINES = 800
 
@@ -69,6 +75,18 @@ class Ps5KbmApp:
 
         self._log_queue: queue.Queue = queue.Queue()
         self._ui_queue: queue.Queue = queue.Queue()
+        # 信号驱动自动切换：证据收集器（三个反馈回调往里喂）与判定定时器
+        self._signals = mode_signals.SignalWatcher()
+        # 最近几帧原始扳机块：载具判定变化时打进日志，方便事后核对（环形缓冲）
+        self._trigger_trace: deque = deque(maxlen=8)
+        self._auto_job: str | None = None
+        # 自动切换编辑页：当前编辑的规则 id 与实时灯定时器
+        self._edit_rule_id: str = ""
+        self._rule_lamp_job: str | None = None
+        # 自动切换编辑面板（弹窗，按需创建）
+        self._rules_window = None
+        # 关窗标志：定时器靠它决定要不要继续续期
+        self._closed = False
         self._setup_logging()
         # 连接页状态（先声明，_state_vars 会按凭据填 _paired）
         self._paired: flow.PairedConsole | None = None
@@ -165,6 +183,8 @@ class Ps5KbmApp:
         # 玩法隔离：只把当前玩法那一侧建起来。键鼠玩法不实例化手柄读取线程/触觉端点，
         # 手柄玩法不实例化键鼠监听/钩子/全局热键/Raw Input 窗口。
         self._sync_input_lifecycle()
+        # 信号驱动的模式自动切换：常驻一个 100ms 判定（没连会话时它自己空转一次就返回）
+        self._auto_job = self.root.after(AUTO_SWITCH_TICK_MS, self._evaluate_auto_switch)
 
     def _pump_raw_messages(self) -> None:
         """主线程定时排空 Raw Input 窗口消息（非阻塞）。
@@ -271,11 +291,16 @@ class Ps5KbmApp:
         self._mapper = InputMapper(self._config)
         self._mapper.set_left_value(self._config.left_stick.value)
         self._edit_mode = self._config.current_mode
+        self._rules = self._make_rules()
         # 键鼠侧对象不在这里建：由 _sync_input_lifecycle 按当前玩法决定要不要实例化，
         # 手柄玩法下这台机器上不该存在任何键鼠监听对象。
         self._source = None
         self._source_ready = False
         return self._config
+
+    def _make_rules(self) -> rule_engine.RuleEngine:
+        """按当前配置造一个规则引擎（规则表来自预设，去抖已在规则里）。"""
+        return rule_engine.RuleEngine(self._config.rules, default_mode="default")
 
     def _mode_label(self, name: str) -> str:
         mode = self._config.modes.get(name)
@@ -415,6 +440,9 @@ class Ps5KbmApp:
         mapping_ui.refresh_mode_ui(self)
         mapping_ui.refresh_mapping_list(self)
         mapping_ui.refresh_stick_keys(self)
+        # 模式增删改名会影响规则的目标/名称显示，编辑面板开着就一起刷新
+        if rules_ui.window_alive(self):
+            rules_ui.refresh_rules_page(self)
 
     def _on_mode_switch(self) -> None:
         """模式切换键：循环切到下一个模式（只在捕获时生效，由输入层保证）。"""
@@ -424,10 +452,156 @@ class Ps5KbmApp:
         current = self._mapper.mode
         index = names.index(current) if current in names else 0
         nxt = names[(index + 1) % len(names)]
-        if self._mapper.set_mode(nxt):
-            self._config.current_mode = nxt
-            # 本方法跑在监听线程上：界面刷新与日志都丢回主线程做
-            self._ui_queue.put(("mode", nxt))
+        if not self._switch_mode(nxt):
+            return
+        # 玩家自己切的：别被规则立刻切回去（正成立的规则要等它冷掉一次）
+        self._rules.notify_manual_switch(time.monotonic(), self._signals)
+
+    def _switch_mode(self, name: str, reason: str = "", carry_movement: bool = False) -> bool:
+        """切映射模式：模式切换键与信号自动切换都走这里。
+
+        返回 False 表示没切（模式不存在或已经是它）。本方法线程安全：监听线程与界面
+        线程都会调，界面更新一律丢回主线程做。
+        carry_movement：把正按着的移动键带到新模式（自动切入时要，手动切换时不要）。
+        """
+        if not self._mapper.set_mode(name, carry_movement=carry_movement):
+            return False
+        self._config.current_mode = name
+        self._ui_queue.put(("mode", (name, reason)))
+        return True
+
+    # ------------------------------------------------- 规则驱动的模式自动切换
+    def _evaluate_auto_switch(self) -> None:
+        """每 100ms 判一次「要不要按规则切模式」（跑在界面线程）。
+
+        只在键鼠玩法 + 会话连着时判定：手柄玩法下映射模式不影响输入，切了没有意义。
+        定时器本身从启动一直续到关窗（没连会话时只做一次判断就返回），否则连上之前
+        就把自己停了。
+        """
+        self._auto_job = None
+        if self._closed:
+            return
+        try:
+            if (
+                self._running
+                and self._bridge is not None
+                and not self._controller_mode()
+                and self._config.auto_switch
+            ):
+                decision = self._rules.update(
+                    time.monotonic(),
+                    self._mapper.mode,
+                    self._signals,
+                    self._config.modes,
+                )
+                if decision is not None:
+                    self._apply_auto_switch(decision)
+        except Exception as exc:  # noqa: BLE001 - 判定出错不能拖垮界面线程
+            logging.getLogger(__name__).warning("规则自动切换判定失败：%s", exc)
+        finally:
+            if not self._closed:
+                self._auto_job = self.root.after(AUTO_SWITCH_TICK_MS, self._evaluate_auto_switch)
+
+    def _apply_auto_switch(self, decision: rule_engine.RuleDecision) -> None:
+        """执行规则引擎的决定，并在日志里说清「为什么切」。"""
+        label = self._mode_label(decision.mode)
+        if decision.leaving:
+            reason = f"规则切模式：「{decision.rule_label}」条件结束 → 回「{label}」"
+        else:
+            reason = f"规则切模式：「{decision.rule_label}」成立 → 「{label}」"
+        # 除了界面日志，再写一份到日志文件：出问题能回溯（面板日志不进文件）
+        logging.getLogger("ps5kbm.mode").info(reason)
+        # 切入时把正按着的移动键带过去：跑着按 F 上车，油门不会掉一拍
+        self._switch_mode(decision.mode, reason, carry_movement=not decision.leaving)
+
+    def _note_trigger_change(self, before: str, after: str) -> None:
+        """扳机块分类变化（跑在协议线程）：按「信号」措辞写日志。
+
+        主机只在变化时下发扳机效果，所以「该切模式却没切」这类问题只能靠变化点留痕。
+        措辞只说信号本身（两侧有没有效果、类型码是多少），不说「进车 / 步行」：
+        规则引擎不知道游戏是什么，日志也不该替它讲故事。
+        最近几帧原始块走 DEBUG：常态下 INFO 只留一行，避免每次上车刷 8 行。
+        """
+        logger = logging.getLogger("ps5kbm.trigger")
+        left, right = self._signals.trigger_blocks()
+        logger.info(
+            "扳机信号：%s → %s（L=%s R=%s）",
+            mode_signals.PAIR_LABELS.get(before, before),
+            mode_signals.PAIR_LABELS.get(after, after),
+            left.hex() or "-",
+            right.hex() or "-",
+        )
+        for stamp, trace_left, trace_right in list(self._trigger_trace):
+            logger.debug(
+                "  最近扳机块 -%.2fs  L=%s  R=%s",
+                max(0.0, time.monotonic() - stamp),
+                trace_left.hex(),
+                trace_right.hex(),
+            )
+
+    def _rule_target_options(self) -> tuple[list[str], dict[str, str]]:
+        """规则目标下拉的选项：显示名 → 模式 id。
+
+        默认模式是「回退目标」，不能当规则的目标（否则进退互相打架），所以排除在外。
+        """
+        labels: list[str] = []
+        mapping: dict[str, str] = {}
+        for name in self._config.modes:
+            if name == "default":
+                continue
+            text = self._mode_option_for(name)
+            labels.append(text)
+            mapping[text] = name
+        return labels, mapping
+
+    def _rules_changed(self, message: str = "", scopes: tuple = ()) -> None:
+        """编辑面板改了规则：重建引擎 → 立刻写盘 → 按需重画面板。
+
+        重画一律推迟一拍（``after(1)``）：调用方可能正是马上要被销毁的那个控件。
+        ``scopes`` 说明该重画哪几块（``"header"`` / ``"list"`` / ``"detail"``）：
+        改前缀、改按钮这类「控件本来就显示着新值」的改动传空 —— 一秒的重画只为了
+        刷新一行文字，不值得。
+        """
+        self._rules.set_rules(self._config.rules)
+        self._persist()
+        if message:
+            self._append_log(message)
+        if not scopes:
+            return
+        try:
+            self.root.after(1, lambda: rules_ui.refresh_rules_page(self, scopes))
+        except Exception:  # noqa: BLE001 - 关窗过程中 Tk 可能已经没了
+            pass
+
+    def toggle_auto_switch(self) -> None:
+        """映射页那个「启用自动切换」开关：只关判定，不删规则。"""
+        enabled = bool(self._auto_switch_var.get())
+        self._config.auto_switch = enabled
+        self._rules.reset()
+        self._persist()
+        mapping_ui.refresh_rules_row(self)
+        if rules_ui.window_alive(self):
+            rules_ui.refresh_rules_page(self)
+        self._append_log("自动切换已启用" if enabled else "自动切换已停用（规则还在）")
+
+    def open_rules_editor(self) -> None:
+        """打开自动切换编辑面板（映射页「编辑规则…」的唯一入口）。"""
+        rules_ui.open_editor(self)
+
+    def _refresh_rules_ui(self) -> None:
+        """规则/开关变了：映射页那一行同步，面板开着的话也一起刷。"""
+        mapping_ui.refresh_rules_row(self)
+        if rules_ui.window_alive(self):
+            rules_ui.refresh_rules_page(self)
+    def _stop_auto_switch(self) -> None:
+        """取消判定定时器（关窗时用）。"""
+        job = self._auto_job
+        self._auto_job = None
+        if job is not None:
+            try:
+                self.root.after_cancel(job)
+            except Exception:  # noqa: BLE001 - 关窗时 Tk 可能已经销毁
+                pass
 
     def _run_loop(self) -> None:
         asyncio.set_event_loop(self._loop)
@@ -447,6 +621,7 @@ class Ps5KbmApp:
             "connect": connect_ui.build_connect_page(self, content),
             "controller": controller_ui.build_controller_page(self, content),
             "mapping": mapping_ui.build_mapping_page(self, content),
+
             "run": run_ui.build_run_page(self, content),
         }
         for page in self._pages.values():
@@ -485,6 +660,7 @@ class Ps5KbmApp:
 
         手柄玩法：手柄页**始终显示**（先接手柄、看电量和设置，再去连 PS5 唤醒）；
         键鼠玩法：映射 / 运行页要 PS5 连上才有意义。
+        自动切换不在侧栏：它只在键鼠玩法下存在，编辑面板从映射页弹出来。
         """
         pages = {"connect"}
         if self._config.controller.mode == "controller":
@@ -920,6 +1096,9 @@ class Ps5KbmApp:
         # 玩法隔离：按当前玩法把对应那一侧拉起来（键鼠：装监听/钩子/热键；手柄：起读取线程），
         # 另一侧这时一定不存在，再由这里兜一次
         self._sync_input_lifecycle()
+        # 新会话：信号证据与自动切换状态都从零开始，避免上一个会话的残留
+        self._signals.reset()
+        self._rules.reset()
         self._running = True
         self._tick_task = asyncio.run_coroutine_threadsafe(self._tick_loop(), self._loop)
         self._append_log("输入通道就绪，按 F8 或点按钮开始捕获")
@@ -945,6 +1124,9 @@ class Ps5KbmApp:
         # 放在 _bridge 置空前：捕获中按住的键还能补一包释放给主机。
         self._release_keyboard_side()
         self._bridge = None
+        # 会话没了：证据与自动切换状态一起清掉
+        self._signals.reset()
+        self._rules.reset()
         self._connecting = False
         self._connect_error = ""
         self._apply_capture_state(False)
@@ -1079,6 +1261,10 @@ class Ps5KbmApp:
                     last_send = now
                     self._bridge.set_sticks(result.left, result.right)
                 if result.events:
+                    # 顺手喂「按钮按下」：规则里的按钮叶子靠这个，跟键位映射天然同步
+                    for button_name, action in result.events:
+                        if action == "press":
+                            self._signals.note_button(button_name)
                     self._bridge.send_events(result.events)
                 # 「摇杆幅度」映射动作会改变 left_value，这里同步到界面显示
                 value = self._mapper.left_value
@@ -1127,6 +1313,8 @@ class Ps5KbmApp:
         self._ui_queue.put(("capture", capturing))
 
     def _on_key_event(self, name: str) -> None:
+        # 键盘事件只用来刷新界面显示；规则里的「按钮按下」由 tick 的 events 提供，
+        # 认的是手柄按钮（△ / ✕ …），所以改键不用同步改规则。
         self._ui_queue.put(("key", name))
 
     # ------------------------------------------------------------ 手柄页
@@ -1306,6 +1494,9 @@ class Ps5KbmApp:
         # 先在旧玩法下释放：扳机 / 马达的释放报告要靠旧玩法仍生效、HID 还开着
         self._leave_input_side(previous)
         self._config.controller.mode = mode
+        # 换了玩法：判定用的证据和自动切换状态都不再适用
+        self._signals.reset()
+        self._rules.reset()
         self._input_mode_var.set(label)
         self._enter_input_side(mode)
         self._apply_capture_state(False)
@@ -1671,6 +1862,9 @@ class Ps5KbmApp:
 
     def _on_console_rumble(self, left: float, right: float) -> None:
         """主机下发的震动值（0~1，跑在协议线程）：转发到本地手柄。"""
+        # 先喂信号判定：键鼠玩法下也要用这份数据判断「是不是在开车」，所以必须在
+        # 下面的闸门之前——闸门管的是「能不能写实体手柄」，不是「能不能看」。
+        self._signals.feed_rumble(left, right)
         cfg = self._config.controller
         if not self._pad_forward_active():
             return
@@ -1691,6 +1885,8 @@ class Ps5KbmApp:
 
     def _on_haptics_pcm(self, pcm: bytes) -> None:
         """主机下发的触觉 PCM（跑在解码线程）：只有手柄玩法 + USB 才写到手柄音频端点。"""
+        # 同上：判定要用，写手柄要过闸门
+        self._signals.feed_haptics_pcm(pcm)
         if not self._pad_forward_active():
             # 键鼠玩法完全不碰实体手柄：连日志都不记，避免看起来像"还在收触觉流"
             return
@@ -1761,6 +1957,12 @@ class Ps5KbmApp:
         分开写会让后一份报告覆盖前一份，只有最后一侧生效。
         另一侧没变化时沿用上一次的块，不会把已有效果清掉。
         """
+        # 先喂事实判定（键鼠玩法下也要用），再走「能不能写实体手柄」的闸门
+        self._trigger_trace.append((time.monotonic(), bytes(left), bytes(right)))
+        pair_before = self._signals.pair
+        self._signals.feed_trigger_effect(left, right)
+        if self._signals.pair != pair_before:
+            self._note_trigger_change(pair_before, self._signals.pair)
         cfg = self._config.controller
         if not self._pad_forward_active():
             return
@@ -1772,10 +1974,8 @@ class Ps5KbmApp:
                 continue
             # 主机在开车/刹车时发 0x05（HID 里是 Off）但带非零参数，
             # 实际含义是「反馈阻力」；实机验证改写成 0x21 后油门/刹车阻尼正常。
-            block = bytearray(block)
-            if block[0] == 0x05 and any(block[1:]):
-                block[0] = 0x21
-            block = bytes(block)
+            # 规则与信号判定共用一份（mode_signals.normalize_trigger_block）。
+            block = mode_signals.normalize_trigger_block(block)
             if self._last_trigger_blocks.get(side) == block:
                 continue
             self._last_trigger_blocks[side] = block
@@ -2470,11 +2670,19 @@ class Ps5KbmApp:
         built = config.build_config(raw)
         self._config.preset = preset
         self._config.modes = built.modes
+        self._config.auto_switch = built.auto_switch
+        # 规则跟着预设走：换预设 = 换这个游戏的一套规则
+        self._config.rules = list(built.rules)
         self._config.mode_switch = built.mode_switch
+        # 去抖时长属于「玩法手感」，跟着预设走（其余手感参数仍由 tuning.json 独立管理）
+        self._config.auto_hold = built.auto_hold
+        self._config.auto_release = built.auto_release
         # 不覆盖 mouse / left_stick：手感参数由 tuning.json 独立管理，
         # 应用预设只换键位映射，用户调好的灵敏度/死区/平滑必须保持不变。
         self._config.current_mode = "default"
         self._edit_mode = "default"
+        # 规则属于预设内容：换预设 = 换整套规则，编辑页也要跟着换
+        self._edit_rule_id = self._config.rules[0].id if self._config.rules else ""
         self._preset_var.set(preset)
         self._preset_owner = preset
         self._rebuild_mapper()
@@ -2482,6 +2690,8 @@ class Ps5KbmApp:
         mapping_ui.refresh_mapping_list(self)
         mapping_ui.refresh_stick_keys(self)
         mapping_ui.refresh_mode_ui(self)
+        if rules_ui.window_alive(self):
+            rules_ui.refresh_rules_page(self)
         self._append_log(f"已应用预设：{preset}")
 
     def _persist(self) -> None:
@@ -2518,6 +2728,8 @@ class Ps5KbmApp:
         self._release_keyboard_side()
         self._mapper = InputMapper(self._config)
         self._mapper.set_left_value(self._config.left_stick.value)
+        # 映射重建 = 模式集合可能变了：自动切换状态从头开始（去抖时长也跟着配置走）
+        self._rules = self._make_rules()
         self._init_keyboard_side()
         if was_capturing and self._source is not None:
             # 捕获中改了映射：重建后必须把捕获接回去，否则覆盖层还开着、
@@ -2573,11 +2785,13 @@ class Ps5KbmApp:
             elif kind == "adjust":
                 self._apply_adjust(value)
             elif kind == "mode":
-                self._edit_mode = value
+                # ("mode", name) 或 ("mode", (name, reason))：reason 说明「为什么切」
+                name, reason = value if isinstance(value, tuple) else (value, "")
+                self._edit_mode = name
                 self._refresh_mode_ui()
-                label = self._mode_label(value)
+                label = self._mode_label(name)
                 self._overlay.set_mode_text(label)
-                self._append_log(f"切换到模式：{label}")
+                self._append_log(reason or f"切换到模式：{label}")
             elif kind == "session_lost":
                 if self._bridge is not None:
                     self._append_log(
@@ -2595,8 +2809,10 @@ class Ps5KbmApp:
 
     def _on_close(self) -> None:
         self._running = False
-        # 先取消两个 Tk 定时器（手柄轮询 / Raw Input 消息泵），否则关窗时 Tk 会报
-        # invalid command name
+        self._closed = True
+        # 先取消 Tk 定时器（模式判定 / 手柄轮询 / Raw Input 消息泵），否则关窗时 Tk
+        # 会报 invalid command name
+        self._stop_auto_switch()
         self._stop_controller_poll()
         self._stop_pump_loop()
         try:

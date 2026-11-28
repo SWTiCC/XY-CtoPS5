@@ -6,9 +6,38 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import customtkinter as ctk
+from customtkinter.windows.widgets.core_rendering import CTkCanvas
 
 from . import theme as T
+
+
+@contextmanager
+def bulk_build(root):
+    """批量建控件时，屏蔽 customtkinter 每个控件自带的 update_idletasks。
+
+    为什么需要：``CTkOptionMenu._draw()`` 末尾会调一次 ``canvas.update_idletasks()``，
+    本意是让下拉箭头立刻排版；但整块界面重建时一次要建几十个控件，每建一个就把
+    整棵控件的待处理队列（排布、重绘）排空一遍，实测变成 O(n²)：
+    规则编辑面板整页重画 1140ms、映射列表重建 771ms。
+    customtkinter 6.0.0 没有「延后 draw」的开关，所以只能在重建期间把它置空，
+    重建结束后统一 update_idletasks 一次 —— 画面结果一样，耗时少一半以上。
+
+    用法：``with bulk_build(app.root): ...建控件...``
+    """
+
+    original = CTkCanvas.update_idletasks
+    CTkCanvas.update_idletasks = lambda self: None
+    try:
+        yield
+    finally:
+        CTkCanvas.update_idletasks = original
+        try:
+            root.update_idletasks()
+        except Exception:  # noqa: BLE001 - 关窗过程中 Tk 可能已经销毁
+            pass
 
 
 def font(size: int, bold: bool = False, mono: bool = False) -> ctk.CTkFont:

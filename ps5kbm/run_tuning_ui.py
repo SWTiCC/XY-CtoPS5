@@ -170,7 +170,6 @@ def build_mouse_tuning(app, parent) -> None:
         side="left"
     )
 
-
 def build_triggers(app, parent) -> None:
     divider(parent)
     _section_header(parent, "扳机深度", "按下时按此深度输出 · 点右侧键名可以改键")

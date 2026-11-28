@@ -14,6 +14,7 @@ from .keys import display_key
 from .ui_common import describe_action, format_stick_keys
 from .ui_widgets import (
     build_card,
+    bulk_build,
     divider,
     font,
     secondary_button,
@@ -117,6 +118,40 @@ def build_mapping_page(app, parent) -> ctk.CTkFrame:
     )
     app._mode_switch_btn.pack(side="right")
 
+    # 第三行：自动切换（规则跟当前预设绑在一起，一个游戏一套）
+    auto_row = ctk.CTkFrame(inner, fg_color="transparent")
+    auto_row.pack(fill="x", pady=(T.S2, 0))
+    ctk.CTkLabel(
+        auto_row, text="自动切换", font=font(T.XS), text_color=T.TEXT_DIM
+    ).pack(side="left", padx=(0, T.S2))
+    app._auto_switch_var = tk.BooleanVar(value=bool(app._config.auto_switch))
+    app._auto_switch_box = ctk.CTkCheckBox(
+        auto_row,
+        text="启用",
+        variable=app._auto_switch_var,
+        command=app.toggle_auto_switch,
+        font=font(T.XS),
+        text_color=T.TEXT_DIM,
+        fg_color=T.ACCENT,
+        hover_color=T.ACCENT_HOVER,
+        border_color=T.BORDER,
+        checkbox_width=16,
+        checkbox_height=16,
+    )
+    app._auto_switch_box.pack(side="left")
+    app._rules_summary_label = ctk.CTkLabel(
+        auto_row, text="", font=font(T.XS), text_color=T.TEXT_FAINT
+    )
+    app._rules_summary_label.pack(side="left", padx=T.S3)
+    secondary_button(
+        auto_row,
+        "编辑规则…",
+        lambda: app.open_rules_editor(),
+        width=88,
+        height=28,
+    ).pack(side="right")
+    refresh_rules_row(app)
+
     list_card = build_card(page, "按键映射", "双击或点编辑修改；支持单按钮、组合键、序列")
     list_card.pack(fill="both", expand=True)
     # CTkScrollableFrame 内部滚动条默认长度会把列表卡撑高，用固定高度的容器包一层；
@@ -170,24 +205,60 @@ def build_mapping_page(app, parent) -> ctk.CTkFrame:
 
 
 def refresh_mapping_list(app) -> None:
-    for child in app._mapping_list.winfo_children():
-        child.destroy()
+    """刷新映射列表。
+
+    键位没变时**原地改文字**，不重建控件：每条映射 6 个 CTk 控件，一轮重建 40 条
+    要 770ms（都跑在界面线程，等于切模式时卡一下）；原地 configure 只要几毫秒。
+    键位集合变了（加/删/改键）才整块重建。
+    """
     rows = app._binding_rows()
     if getattr(app, "_mapping_count_label", None) is not None:
         app._mapping_count_label.configure(text=f"共 {len(rows)} 条")
-    if not rows:
-        empty = ctk.CTkFrame(app._mapping_list, fg_color=T.SURFACE, corner_radius=T.R_MD)
-        empty.pack(fill="x", padx=T.S2, pady=T.S2)
-        ctk.CTkLabel(
-            empty,
-            text="还没有映射，点下面的「添加映射」开始",
-            font=font(T.SM),
-            text_color=T.TEXT_FAINT,
-        ).pack(padx=T.S4, pady=T.S4)
+    if _refresh_rows_in_place(app, rows):
         return
+    with bulk_build(app.root):
+        for child in app._mapping_list.winfo_children():
+            child.destroy()
+        app._mapping_views = {}
+        if not rows:
+            empty = ctk.CTkFrame(app._mapping_list, fg_color=T.SURFACE, corner_radius=T.R_MD)
+            empty.pack(fill="x", padx=T.S2, pady=T.S2)
+            ctk.CTkLabel(
+                empty,
+                text="还没有映射，点下面的「添加映射」开始",
+                font=font(T.SM),
+                text_color=T.TEXT_FAINT,
+            ).pack(padx=T.S4, pady=T.S4)
+            return
+        for source, value in rows:
+            _mapping_row(app, source, value)
+
+
+def _refresh_rows_in_place(app, rows) -> bool:
+    """键位集合没变就只改动作文字 / 键名 chip 颜色；变了返回 False 交给整块重建。"""
+    views: dict = getattr(app, "_mapping_views", {})
+    if not views or list(views) != [source for source, _value in rows]:
+        return False
     for source, value in rows:
-        _mapping_row(app, source, value)
-    app._mapping_list.update_idletasks()
+        view = views[source]
+        try:
+            view.action.configure(text=describe_action(value))
+            view.chip.configure(
+                fg_color=T.ACCENT_SOFT if source.startswith("mouse_") else T.SURFACE_HOVER
+            )
+        except Exception:  # noqa: BLE001 - 控件被销毁过就退化成整块重建
+            return False
+    return True
+
+
+class _MappingRowView:
+    """一行映射里会被刷新的控件（键位不变时只改这些）。"""
+
+    __slots__ = ("chip", "action")
+
+    def __init__(self, chip, action) -> None:
+        self.chip = chip
+        self.action = action
 
 
 def _mapping_row(app, source: str, value) -> None:
@@ -196,7 +267,7 @@ def _mapping_row(app, source: str, value) -> None:
     row.pack(fill="x", padx=T.S2, pady=2)
 
     is_mouse = source.startswith("mouse_")
-    ctk.CTkLabel(
+    chip = ctk.CTkLabel(
         row,
         text=display_key(source),
         width=128,
@@ -205,15 +276,17 @@ def _mapping_row(app, source: str, value) -> None:
         fg_color=T.ACCENT_SOFT if is_mouse else T.SURFACE_HOVER,
         text_color=T.TEXT,
         font=font(T.SM, mono=not is_mouse),
-    ).pack(side="left", padx=(T.S2, T.S2), pady=T.S1)
+    )
+    chip.pack(side="left", padx=(T.S2, T.S2), pady=T.S1)
 
-    ctk.CTkLabel(
+    action = ctk.CTkLabel(
         row,
         text=describe_action(value),
         anchor="w",
         font=font(T.SM),
         text_color=T.TEXT_DIM,
-    ).pack(side="left", fill="x", expand=True, pady=T.S1)
+    )
+    action.pack(side="left", fill="x", expand=True, pady=T.S1)
 
     ctk.CTkButton(
         row,
@@ -234,6 +307,9 @@ def _mapping_row(app, source: str, value) -> None:
     secondary_button(row, "改键", lambda: app.rebind_mapping(source), width=52, height=28).pack(
         side="right", padx=(0, T.S2), pady=T.S1
     )
+    if not hasattr(app, "_mapping_views"):
+        app._mapping_views = {}
+    app._mapping_views[source] = _MappingRowView(chip, action)
 
 
 def refresh_stick_keys(app) -> None:
@@ -253,3 +329,25 @@ def refresh_mode_ui(app) -> None:
         app._mode_switch_btn.configure(
             text=f"切换键 {display_key(app._config.mode_switch)}"
         )
+    refresh_rules_row(app)
+
+
+def refresh_rules_row(app) -> None:
+    """同步「自动切换」那一行：开关状态与规则摘要（规则跟着当前预设走）。"""
+    summary = getattr(app, "_rules_summary_label", None)
+    if summary is None:
+        return
+    box = getattr(app, "_auto_switch_box", None)
+    if box is not None:
+        app._auto_switch_var.set(bool(app._config.auto_switch))
+    rules = app._config.rules
+    if not rules:
+        summary.configure(text="这个预设还没有规则")
+        return
+    targets = "、".join(
+        dict.fromkeys(f"「{app._mode_label(rule.target)}」" for rule in rules)
+    )
+    text = f"{len(rules)} 条规则 → {targets}"
+    if not app._config.auto_switch:
+        text += "（已停用）"
+    summary.configure(text=text)

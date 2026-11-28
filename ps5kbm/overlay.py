@@ -19,6 +19,8 @@ import ctypes
 import logging
 import tkinter as tk
 
+from . import windows
+
 _LOGGER = logging.getLogger(__name__)
 
 _user32 = ctypes.windll.user32
@@ -178,14 +180,32 @@ class CaptureOverlay:
         if win is None:
             return
         try:
-            # 每轮重新置顶；只有 grab_focus 时才抢焦点
+            # 每轮重新置顶（便宜、不动焦点）；焦点只在真被别的程序抢走时才抢回来
             win.attributes("-topmost", True)
-            if self._grab_focus:
-                win.lift()
-                win.focus_force()
             if self._badge is not None:
                 self._badge.attributes("-topmost", True)
                 self._badge.lift()
+            if self._grab_focus and self._should_steal_focus():
+                win.lift()
+                win.focus_force()
+                _LOGGER.info("覆盖层抢回焦点（前台原本是别的窗口）")
         except tk.TclError:
             return
         self._timer = self._root.after(_KEEP_FOCUS_MS, self._keep_focus)
+
+    def _should_steal_focus(self) -> bool:
+        """这一轮要不要抢焦点。
+
+        两种情况不能抢：
+        - 用户正按着鼠标键：拖动窗口 / 拖动滑块时改变激活窗口，Windows 会取消整次
+          拖动并把窗口弹回原位 —— 就是「一拖就瞬间回去了」；
+        - 前台本来就是本程序：没有可抢的东西，白抢只会打断鼠标操作。
+
+        输入本身不依赖焦点（键盘走低级钩子、鼠标走 Raw Input），所以少抢几次
+        不影响按键，只是保留抢焦点作为 pynput 兜底路径的保险。
+        """
+        if windows.mouse_button_down():
+            return False
+        if windows.foreground_is_ours():
+            return False
+        return True

@@ -11,9 +11,61 @@
     "smoothing": 0.5
   },
   "left_stick": {
-    "value": 0.3,
+    "value": 1.0,
     "ramp": 4.0
   },
+  "auto_hold": 0.8,
+  "auto_release": 1.2,
+  "auto_switch": true,
+  "rules": [
+    {
+      "id": "gta6-driving",
+      "label": "上车 → 驾驶",
+      "enabled": true,
+      "target": "driving",
+      "enter_hold": 0.8,
+      "leave_delay": 1.2,
+      "enter": {
+        "type": "latch",
+        "set": {
+          "type": "trigger",
+          "kind": "resistance",
+          "prefix": "ff03",
+          "side": "both"
+        },
+        "clear": {
+          "type": "all",
+          "children": [
+            {
+              "type": "button",
+              "name": "TRIANGLE"
+            },
+            {
+              "type": "trigger",
+              "kind": "off",
+              "prefix": "",
+              "side": "both"
+            }
+          ]
+        }
+      },
+      "leave": {
+        "type": "all",
+        "children": [
+          {
+            "type": "button",
+            "name": "TRIANGLE"
+          },
+          {
+            "type": "trigger",
+            "kind": "off",
+            "prefix": "",
+            "side": "both"
+          }
+        ]
+      }
+    }
+  ],
   "keyboard_sticks": {
     "up": [
       "w"
@@ -144,8 +196,8 @@
         "esc": "OPTIONS",
         "alt_l": {
           "stick": [
-            0.3,
-            1.0
+            1.0,
+            0.3
           ]
         },
         "ctrl_l": "RIGHT",

@@ -46,3 +46,6 @@ video/
 # 运行时诊断日志
 faulthandler.log
 stdout.log
+
+# 手工改配置前的本地备份
+*.json.bak

@@ -15,6 +15,8 @@ import os
 import sys
 from dataclasses import dataclass, field, fields
 
+from . import legacy_rules, rule_engine
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -215,6 +217,7 @@ class ModeConfig:
 
     label：界面上显示的名字（显示在透明窗口右上角）。
     三组映射在每个模式下都是完整的；没单独设置的模式用 default 的内容。
+    自动切换不在这里配：见 ``AppConfig.rules``（规则表，条件树 → 目标模式）。
     """
 
     label: str = ""
@@ -250,6 +253,12 @@ class AppConfig:
     # 多模式映射：键是模式 id，至少包含 "default"
     modes: dict[str, ModeConfig] = field(default_factory=dict)
     current_mode: str = "default"
+    # 自动切换：规则跟按键预设绑在一起（一个游戏一套），auto_switch 只是总开关。
+    auto_switch: bool = True
+    rules: list[rule_engine.Rule] = field(default_factory=list)
+    # 新规则默认继承的去抖（秒）：进入要连续成立这么久，退出要连续成立这么久
+    auto_hold: float = rule_engine.DEFAULT_ENTER_HOLD_S
+    auto_release: float = rule_engine.DEFAULT_LEAVE_DELAY_S
 
 
 def build_mode(raw: dict, fallback: ModeConfig | None = None) -> ModeConfig:
@@ -303,6 +312,10 @@ def preset_to_dict(name: str, cfg: AppConfig) -> dict:
             "smoothing": cfg.mouse.smoothing,
         },
         "left_stick": {"value": cfg.left_stick.value, "ramp": cfg.left_stick.ramp},
+        "auto_hold": cfg.auto_hold,
+        "auto_release": cfg.auto_release,
+        "auto_switch": cfg.auto_switch,
+        "rules": rule_engine.rules_to_dict(cfg.rules),
         "keyboard_sticks": default_mode.keyboard_sticks,
         "keyboard_buttons": default_mode.keyboard_buttons,
         "mouse_buttons": default_mode.mouse_buttons,
@@ -310,11 +323,34 @@ def preset_to_dict(name: str, cfg: AppConfig) -> dict:
     }
 
 
+def legacy_ruleset_path(name: str) -> str:
+    """老版本（规则集单独成文件时）留下的路径：只用于一次性迁移。"""
+    if not name:
+        return ""
+    return os.path.join(PROJECT_ROOT, "rulesets", f"{name}.json")
+
+
+def load_legacy_ruleset(name: str):
+    """读老版本的 ``rulesets/<名字>.json``；没有就返回空列表。
+
+    规则现在跟着按键预设走（一个游戏一套），这个函数只为把上一版留下的文件搬进预设。
+    """
+    path = legacy_ruleset_path(name)
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        data = _read_json(path)
+    except (OSError, ValueError):
+        return []
+    return rule_engine.parse_rules(data.get("rules"))
+
+
 def new_empty_config(preset_name: str, base: AppConfig | None = None) -> AppConfig:
     """新建预设用的空配置：只有一个「默认」模式，三组映射都为空。
 
     传入 base 时沿用它的**非映射**设置（热键 / 切换键 / 调参键 / 目标窗口 /
-    手感与扳机深度）。否则新建一个预设会把用户的切换键悄悄重置成默认 F9。
+    手感与扳机深度）。否则新建一个预设会把用户的切换键
+    悄悄重置成默认 F9。
     """
     cfg = AppConfig(
         preset=str(preset_name),
@@ -332,6 +368,9 @@ def new_empty_config(preset_name: str, base: AppConfig | None = None) -> AppConf
         cfg.l2_depth = base.l2_depth
         cfg.mouse = copy.deepcopy(base.mouse)
         cfg.left_stick = copy.deepcopy(base.left_stick)
+        # 规则集是「用哪套自动切换」，属于玩法设置而不是键位：新预设默认沿用
+        cfg.auto_hold = base.auto_hold
+        cfg.auto_release = base.auto_release
     return cfg
 
 
@@ -531,10 +570,30 @@ def build_config(raw: dict) -> AppConfig:
         }
     )
     modes: dict[str, ModeConfig] = {"default": default_mode}
-    for name, mode_raw in (raw.get("modes") or {}).items():
+    raw_modes = raw.get("modes") or {}
+    for name, mode_raw in raw_modes.items():
         if not isinstance(mode_raw, dict):
             continue
         modes[str(name)] = build_mode(mode_raw, default_mode)
+    # 去抖：预设级默认值，新建规则继承它；单条规则可以覆盖
+    hold = _clamp(
+        raw.get("auto_hold", rule_engine.DEFAULT_ENTER_HOLD_S),
+        0.0,
+        10.0,
+        rule_engine.DEFAULT_ENTER_HOLD_S,
+    )
+    release = _clamp(
+        raw.get("auto_release", rule_engine.DEFAULT_LEAVE_DELAY_S),
+        0.0,
+        10.0,
+        rule_engine.DEFAULT_LEAVE_DELAY_S,
+    )
+    # 规则跟按键预设绑在一起（一个游戏一套）：进进来解析，写盘时原样写回预设。
+    rules = rule_engine.parse_rules(raw.get("rules"), hold, release)
+    rules += legacy_rules.migrate_legacy_modes(raw_modes, hold, release, rules)
+    # 默认模式是「回退目标」：它靠退出条件回到这里，不能再被规则当成目标，否则
+    # 退出和进入会互相打架（刚切回默认又被切走）。
+    rules = [rule for rule in rules if rule.target != "default"]
     # 启动时始终从 default 模式开始：运行时按切换键切到的模式只在本次运行
     # 内有效，避免下次启动还停在“驾驶”这种非默认模式上。
     current = "default"
@@ -559,6 +618,10 @@ def build_config(raw: dict) -> AppConfig:
         controller=_build_controller(raw.get("controller") or {}),
         modes=modes,
         current_mode=current,
+        auto_switch=bool(raw.get("auto_switch", True)),
+        rules=rules,
+        auto_hold=hold,
+        auto_release=release,
     )
 
 
@@ -671,7 +734,22 @@ def load_config(path: str = DEFAULT_CONFIG_PATH) -> AppConfig:
         for depth_key in ("r2_depth", "l2_depth"):
             if depth_key in tuning:
                 merged[depth_key] = tuning[depth_key]
-    return build_config(merged)
+    cfg = build_config(merged)
+    _migrate_legacy_ruleset(cfg)
+    return cfg
+
+
+def _migrate_legacy_ruleset(cfg: AppConfig) -> None:
+    """把上一版留下的 ``rulesets/<预设名>.json`` 搬进当前配置（一次性迁移）。
+
+    规则现在跟着按键预设走；这一步只在「预设里还没有规则、但存在同名老文件」时生效，
+    下次写盘后老文件就不会再被读。有 IO，所以放在 load_config 里而不是 build_config。
+    """
+    if cfg.rules:
+        return
+    migrated = load_legacy_ruleset(cfg.preset)
+    if migrated:
+        cfg.rules = [rule for rule in migrated if rule.target != "default"]
 
 
 def save_default_config(path: str = DEFAULT_CONFIG_PATH) -> None:
@@ -731,6 +809,10 @@ def config_to_dict(cfg: AppConfig) -> dict:
         },
         "r2_depth": cfg.r2_depth,
         "l2_depth": cfg.l2_depth,
+        "auto_hold": cfg.auto_hold,
+        "auto_release": cfg.auto_release,
+        "auto_switch": cfg.auto_switch,
+        "rules": rule_engine.rules_to_dict(cfg.rules),
         "controller": {
             "mode": cfg.controller.mode,
             "gyro": {

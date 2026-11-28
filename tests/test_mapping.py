@@ -11,7 +11,10 @@ from ps5kbm.mapping import InputMapper, parse_action
 def make_config(**mouse_overrides) -> AppConfig:
     # 测试基线不启用反死区（anti_deadzone=0），需要时用 overrides 打开
     mouse = MouseConfig(
-        sensitivity=1.0, curve=1.0, deadzone=0.0, anti_deadzone=0.0
+        sensitivity=1.0,
+        curve=1.0,
+        deadzone=0.0,
+        anti_deadzone=0.0,
     )
     for key, value in mouse_overrides.items():
         setattr(mouse, key, value)
@@ -206,6 +209,57 @@ class ButtonTests(unittest.TestCase):
         self.assertEqual(mapper.tick(0.004).events, [])
 
 
+class ModeSwitchTests(unittest.TestCase):
+    """切换模式：默认清空按键；自动切入驾驶时把正按着的移动键带过去。"""
+
+    def _config_with_driving(self) -> AppConfig:
+        config = make_config()
+        config.modes["driving"] = ModeConfig(
+            label="驾驶",
+            keyboard_sticks={"up": ["w"], "down": ["s"], "left": ["a"], "right": ["d"]},
+            # 驾驶模式里 W/S 变成油门 / 刹车，和 GTA6 预设一致
+            keyboard_buttons={"w": "R2", "s": "L2", "space": "CROSS"},
+        )
+        return config
+
+    def test_plain_switch_drops_held_keys(self):
+        mapper = InputMapper(self._config_with_driving())
+        mapper.on_key("w", True)
+        mapper.tick(0.004)
+        self.assertTrue(mapper.set_mode("driving"))
+        # 没带过去：W 不再算按住，也就不该有油门
+        events = mapper.tick(0.004).events
+        self.assertNotIn(("R2", "press"), events)
+        self.assertEqual(mapper.tick(0.004).events, [])
+
+    def test_auto_switch_carries_movement_keys(self):
+        mapper = InputMapper(self._config_with_driving())
+        mapper.on_key("w", True)
+        mapper.tick(0.004)
+        self.assertTrue(mapper.set_mode("driving", carry_movement=True))
+        # W 被带过去：新模式里它是 R2，下一帧就该按住油门
+        first = mapper.tick(0.004)
+        self.assertIn(("R2", "press"), first.events)
+        # 松开 W 后油门跟着松
+        mapper.on_key("w", False)
+        self.assertIn(("R2", "release"), mapper.tick(0.004).events)
+
+    def test_carry_only_takes_movement_keys(self):
+        """非方向键（比如 CROSS 那种动作键）不会被带过去，免得切换顺手放出技能。"""
+        mapper = InputMapper(self._config_with_driving())
+        mapper.on_key("space", True)
+        mapper.tick(0.004)
+        self.assertTrue(mapper.set_mode("driving", carry_movement=True))
+        # 驾驶模式里 space 也是 CROSS：如果被带过去这里会释放（无按下），
+        # 交付点在于不能出现新的 press
+        self.assertNotIn(("CROSS", "press"), mapper.tick(0.004).events)
+
+    def test_switching_to_same_mode_is_noop(self):
+        mapper = InputMapper(self._config_with_driving())
+        self.assertFalse(mapper.set_mode("default"))
+        self.assertFalse(mapper.set_mode("不存在"))
+
+
 class ActionParseTests(unittest.TestCase):
     def test_parse_plain_string(self):
         action = parse_action("cross")
@@ -330,6 +384,36 @@ class StickActionTests(unittest.TestCase):
         self.assertAlmostEqual(mapper.left_value, 1.0)
         press()
         self.assertAlmostEqual(mapper.left_value, 0.5)
+
+    def test_stick_cycle_starts_from_current_value(self):
+        """默认 1.0 + 档位 [1.0, 0.3]：第一下直接切 0.3，不会白按一次。"""
+        config = make_config()
+        config.modes["default"].keyboard_buttons["k"] = {"stick": [1.0, 0.3]}
+        mapper = InputMapper(config)
+        self.assertAlmostEqual(mapper.left_value, config.left_stick.value)
+
+        def press() -> None:
+            mapper.on_key("k", True)
+            mapper.on_key("k", False)
+
+        press()
+        self.assertAlmostEqual(mapper.left_value, 0.3)
+        press()
+        self.assertAlmostEqual(mapper.left_value, 1.0)
+        press()
+        self.assertAlmostEqual(mapper.left_value, 0.3)
+
+    def test_stick_cycle_falls_back_when_current_not_listed(self):
+        """当前值不在档位里（比如被别的预设设过）：按顺序取第一个档位。"""
+        config = make_config()
+        config.modes["default"].keyboard_buttons["k"] = {"stick": [1.0, 0.3]}
+        mapper = InputMapper(config)
+        mapper.set_left_value(0.7)
+        mapper.on_key("k", True)
+        self.assertAlmostEqual(mapper.left_value, 1.0)
+        mapper.on_key("k", False)
+        mapper.on_key("k", True)
+        self.assertAlmostEqual(mapper.left_value, 0.3)
 
 
 if __name__ == "__main__":

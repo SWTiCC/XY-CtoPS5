@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ps5kbm import config
+from ps5kbm import config, rule_engine, signal_rules
 
 # 不写系统临时目录（部分环境对 %TEMP% 有限制），用仓库内固定目录并在结束后清理
 TMP_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp")
@@ -349,6 +349,184 @@ class ControllerConfigTests(unittest.TestCase):
                 {"controller": {"gyro": {"activation": name}}}
             )
             self.assertEqual(cfg.controller.gyro.activation, name)
+
+
+class RulesConfigTests(unittest.TestCase):
+    """规则表：读写往返、旧配置迁移、默认模式不被当目标、非法值回落。"""
+
+    def test_defaults(self):
+        cfg = config.build_config({})
+        self.assertEqual(cfg.rules, [])
+        self.assertAlmostEqual(cfg.auto_hold, rule_engine.DEFAULT_ENTER_HOLD_S)
+        self.assertAlmostEqual(cfg.auto_release, rule_engine.DEFAULT_LEAVE_DELAY_S)
+
+    def test_roundtrip(self):
+        cfg = config.build_config(
+            {
+                "auto_hold": 1.5,
+                "auto_release": 2.5,
+                "auto_switch": False,
+                "rules": [
+                    {
+                        "id": "drive",
+                        "label": "开车",
+                        "target": "驾驶",
+                        "enter": {"type": "trigger", "kind": "resistance", "prefix": "", "side": "any"},
+                    }
+                ],
+                "modes": {"驾驶": {"label": "驾驶"}},
+            }
+        )
+        self.assertAlmostEqual(cfg.auto_hold, 1.5)
+        self.assertAlmostEqual(cfg.auto_release, 2.5)
+        self.assertFalse(cfg.auto_switch)
+        self.assertEqual(len(cfg.rules), 1)
+        self.assertEqual(cfg.rules[0].id, "drive")
+        # 规则没写去抖就继承预设级默认值
+        self.assertAlmostEqual(cfg.rules[0].enter_hold, 1.5)
+        self.assertAlmostEqual(cfg.rules[0].leave_delay, 2.5)
+
+        data = config.config_to_dict(cfg)
+        self.assertFalse(data["auto_switch"])
+        self.assertEqual(len(data["rules"]), 1)
+        rebuilt = config.build_config(data)
+        self.assertEqual(rebuilt.rules[0].enter, cfg.rules[0].enter)
+        self.assertFalse(rebuilt.auto_switch)
+
+    def test_legacy_mode_signal_migrates_to_rule(self):
+        """旧配置（模式上直接写 auto_signal）自动变成等价规则。"""
+        cfg = config.build_config(
+            {
+                "modes": {
+                    "驾驶": {
+                        "label": "驾驶",
+                        "auto_signal": "vehicle_entry",
+                        "auto_leave": True,
+                    }
+                }
+            }
+        )
+        self.assertEqual(len(cfg.rules), 1)
+        rule = cfg.rules[0]
+        self.assertEqual(rule.target, "驾驶")
+        self.assertEqual(rule.enter["type"], "latch")
+        self.assertIsNotNone(rule.leave)
+        # 迁移出来的规则必须能编译，不然等于没迁移
+        signal_rules.parse_condition(rule.enter)
+        signal_rules.parse_condition(rule.leave)
+
+    def test_legacy_skipped_when_rule_already_targets_mode(self):
+        """预设已带规则时不重复迁移（否则同一模式两条规则抢着切）。"""
+        cfg = config.build_config(
+            {
+                "rules": [
+                    {
+                        "id": "gta6-driving",
+                        "target": "driving",
+                        "enter": {"type": "fact", "fact": "trigger.vehicle"},
+                    }
+                ],
+                "modes": {
+                    "driving": {
+                        "label": "驾驶",
+                        "auto_signal": "vehicle_entry",
+                    }
+                },
+            }
+        )
+        self.assertEqual([rule.id for rule in cfg.rules], ["gta6-driving"])
+
+    def test_unknown_legacy_signal_is_ignored(self):
+        cfg = config.build_config(
+            {"modes": {"驾驶": {"label": "驾驶", "auto_signal": "不存在的信号"}}}
+        )
+        self.assertEqual(cfg.rules, [])
+
+    def test_default_mode_is_never_a_rule_target(self):
+        """默认模式是回退目标：规则指向它会被丢掉，否则进退会互相打架。"""
+        cfg = config.build_config(
+            {
+                "rules": [
+                    {
+                        "id": "bad",
+                        "target": "default",
+                        "enter": {"type": "fact", "fact": "rumble"},
+                    }
+                ],
+                "modes": {"default": {"label": "默认", "auto_signal": "rumble"}},
+            }
+        )
+        self.assertEqual(cfg.rules, [])
+
+    def test_broken_rule_is_dropped(self):
+        cfg = config.build_config(
+            {
+                "rules": [
+                    {"id": "no-target", "enter": {"type": "fact", "fact": "rumble"}},
+                    {
+                        "id": "bad-fact",
+                        "target": "驾驶",
+                        "enter": {"type": "fact", "fact": "不存在的事实"},
+                    },
+                    {
+                        "id": "ok",
+                        "target": "驾驶",
+                        "enter": {"type": "fact", "fact": "rumble"},
+                    },
+                ],
+                "modes": {"驾驶": {"label": "驾驶"}},
+            }
+        )
+        self.assertEqual([rule.id for rule in cfg.rules], ["ok"])
+
+    def test_invalid_delay_falls_back(self):
+        cfg = config.build_config({"auto_hold": "坏数据", "auto_release": 99})
+        self.assertAlmostEqual(cfg.auto_hold, rule_engine.DEFAULT_ENTER_HOLD_S)
+        self.assertAlmostEqual(cfg.auto_release, 10.0)
+
+
+
+class PresetRulesTests(unittest.TestCase):
+    """自动切换规则跟按键预设绑在一起（一个游戏一套）。"""
+
+    def test_builtin_preset_carries_gta6_rule(self):
+        raw = config.load_preset("gta6")
+        self.assertTrue(raw.get("auto_switch"))
+        rules = config.build_config({**raw, "preset": "gta6"}).rules
+        self.assertEqual([rule.target for rule in rules], ["driving"])
+        # 规则已经参数化：不再是写死的游戏特征
+        self.assertEqual(rules[0].enter["set"]["type"], "trigger")
+        self.assertEqual(rules[0].enter["set"]["prefix"], "ff03")
+
+    def test_auto_switch_can_be_disabled(self):
+        cfg = config.build_config({"auto_switch": False, "rules": []})
+        self.assertFalse(cfg.auto_switch)
+        self.assertFalse(config.config_to_dict(cfg)["auto_switch"])
+
+    def test_legacy_ruleset_file_migrates_into_preset(self):
+        """上一版把规则存在 rulesets/<预设名>.json：加载时搬进配置（一次性）。"""
+        cases = [
+            {
+                "id": "old",
+                "target": "驾驶",
+                "enter": {"type": "trigger", "kind": "resistance", "prefix": "", "side": "any"},
+            }
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "rulesets"), exist_ok=True)
+            with open(
+                os.path.join(tmp, "rulesets", "legacy.json"), "w", encoding="utf-8"
+            ) as handle:
+                json.dump({"rules": cases}, handle)
+            with mock.patch.object(config, "PROJECT_ROOT", tmp):
+                cfg = config.build_config({"preset": "legacy", "modes": {"驾驶": {}}})
+                self.assertEqual(cfg.rules, [])
+                config._migrate_legacy_ruleset(cfg)
+                self.assertEqual([rule.id for rule in cfg.rules], ["old"])
+                # 预设里已经有规则时不再读老文件
+                cfg.rules = [rule for rule in cfg.rules]
+                config._migrate_legacy_ruleset(cfg)
+                self.assertEqual([rule.id for rule in cfg.rules], ["old"])
 
 
 if __name__ == "__main__":

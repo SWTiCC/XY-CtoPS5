@@ -67,7 +67,8 @@ class Action:
         chord    组合键（同时按多个按钮）
         sequence 序列宏（依次按）
         stick    调整左摇杆幅度；values 有一个值时每次设为该值，
-                 有多个值时每按一次循环切到下一个值
+                 有多个值时每按一次按顺序循环切到下一个（从当前值往后走，
+                 所以默认 1.0 + 档位 [1.0, 0.3] 时第一下就是 0.3）
     """
 
     kind: str
@@ -279,16 +280,31 @@ class InputMapper:
     def mode_names(self) -> list[str]:
         return list(self._modes)
 
-    def set_mode(self, name: str) -> bool:
-        """切换映射模式；切换前清空按下的键，避免卡键。"""
+    def set_mode(self, name: str, carry_movement: bool = False) -> bool:
+        """切换映射模式；切换前清空按下的键，避免卡键。
+
+        carry_movement：把「正按着的移动键」带到新模式里。自动切入驾驶时要用——
+        你正按着 W 跑过去按 F 上车，切换瞬间把 W 松掉的话油门会掉一拍，
+        玩家得抬手重按。只带目标模式的方向键（WASD 这类），不带其它按键，
+        免得切换时把某个宏或按钮顺手点出来。
+        """
         with self._lock:
             if name not in self._modes or name == self._current_mode:
                 return False
+            carried: set[str] = set()
+            if carry_movement:
+                movement: set[str] = set()
+                for keys in self._modes[name]["keyboard_sticks"].values():
+                    movement.update(keys)
+                carried = self._keys & movement
             self._keys.clear()
             self._mouse_buttons.clear()
             self._sequence = None
             self._sequence_buttons.clear()
             self._apply_mode(name)
+            # 移交给新模式后再放回按键集合：持续型按钮（油门 R2）下一帧就会接着按，
+            # 松开时照常从这里移除
+            self._keys.update(carried)
             return True
 
     @staticmethod
@@ -340,9 +356,26 @@ class InputMapper:
         if action.kind == "sequence":
             self._begin_sequence(action, trigger)
         elif action.kind == "stick" and action.values:
-            index = action.cycle_index % len(action.values)
-            self._left_value = action.values[index]
-            action.cycle_index = (index + 1) % len(action.values)
+            self._left_value = self._next_stick_value(action)
+
+    def _next_stick_value(self, action: Action) -> float:
+        """按一下「摇杆幅度」键之后的新幅度。
+
+        多档时以**当前值**为锚点往后走：默认 1.0、档位写成 ``[1.0, 0.3]``，第一下直接
+        切到 0.3，不会先「设成 1.0」白按一次。当前值不在档位里（被别的按键或旧预设改过）
+        才退回按轮转下标取下一个。
+        """
+        values = action.values
+        try:
+            current = values.index(self._left_value)
+        except ValueError:
+            # 不知道现在在哪一档：按顺序从第一个开始，和旧行为一致
+            index = action.cycle_index % len(values)
+            action.cycle_index = (index + 1) % len(values)
+            return values[index]
+        index = (current + 1) % len(values)
+        action.cycle_index = index
+        return values[index]
 
     def on_mouse_delta(self, dx: int, dy: int) -> None:
         with self._lock:
